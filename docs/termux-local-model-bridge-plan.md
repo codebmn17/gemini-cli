@@ -154,11 +154,11 @@ local-only route. At `v0.55.1`, `createContentGeneratorConfig()` reads
 `GEMINI_API_KEY` for the `GATEWAY` branch, `createContentGenerator()` merges
 `GEMINI_CLI_CUSTOM_HEADERS` into model request headers, and
 `packages/cli/src/config/config.ts` derives `Config.proxy` from
-`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, or `http_proxy`. The same content
--generator path reads `GOOGLE_GENAI_API_VERSION`, which can change the protocol
-version sent to the custom endpoint. A local wrapper must therefore isolate
-those transport inputs rather than assuming a loopback base URL alone prevents
-credential, header, proxy, or protocol-shape inheritance.
+`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, or `http_proxy`. The same
+content-generator path reads `GOOGLE_GENAI_API_VERSION`, which can change the
+protocol version sent to the custom endpoint. A local wrapper must therefore
+isolate those transport inputs rather than assuming a loopback base URL alone
+prevents credential, header, proxy, or protocol-shape inheritance.
 
 There is a second environment boundary above those reads. Every normal startup
 runs `loadEnvironment()` from `packages/cli/src/config/settings.ts`. That loader
