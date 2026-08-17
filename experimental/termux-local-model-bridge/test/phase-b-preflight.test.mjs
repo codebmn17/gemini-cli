@@ -107,10 +107,7 @@ test('trusted env selection prefers workspace .gemini/.env over generic .env', (
 test('untrusted selection ignores workspace .gemini/.env', () => {
   const f = fixture();
   try {
-    writeFileSync(
-      path.join(f.workspace, '.gemini', '.env'),
-      'GEMINI_API_KEY=secret\n',
-    );
+    writeFileSync(path.join(f.workspace, '.gemini', '.env'), 'GEMINI_API_KEY=secret\n');
     const generic = path.join(f.workspace, '.env');
     writeFileSync(generic, 'GOOGLE_API_KEY=other\n');
     assert.equal(
@@ -219,15 +216,10 @@ test('preflight fails closed on native policy and settings-path override', () =>
   const f = fixture();
   try {
     mkdirSync(path.dirname(f.native.systemSettings), { recursive: true });
-    writeFileSync(
-      f.native.systemSettings,
-      '{"security":{"folderTrust":{"enabled":false}}}',
-    );
+    writeFileSync(f.native.systemSettings, '{"security":{"folderTrust":{"enabled":false}}}');
     const report = runPhaseBPreflight({
       workspaceDir: f.workspace,
-      environment: {
-        GEMINI_CLI_SYSTEM_DEFAULTS_PATH: '/secret/custom-defaults.json',
-      },
+      environment: { GEMINI_CLI_SYSTEM_DEFAULTS_PATH: '/secret/custom-defaults.json' },
       osHome: f.home,
       nativePaths: f.native,
     });
@@ -235,14 +227,13 @@ test('preflight fails closed on native policy and settings-path override', () =>
     assert.ok(report.blockers.includes('native-system-settings-present'));
     assert.ok(report.blockers.includes('system-defaults-override-present'));
     assert.equal(report.selectedEnv.status, 'undetermined');
-    assert.equal(
-      JSON.stringify(report).includes('/secret/custom-defaults.json'),
-      false,
-    );
+    assert.equal(JSON.stringify(report).includes('/secret/custom-defaults.json'), false);
   } finally {
     f.cleanup();
   }
 });
+
+
 
 test('preflight honors the pinned trust-workspace env override without exposing its value', () => {
   const f = fixture();
@@ -256,10 +247,7 @@ test('preflight honors the pinned trust-workspace env override without exposing 
     assert.equal(report.workspaceTrust.isTrusted, true);
     assert.equal(report.workspaceTrust.source, 'env');
     assert.equal(report.inherited.control.GEMINI_CLI_TRUST_WORKSPACE, true);
-    assert.equal(
-      JSON.stringify(report).includes('"GEMINI_CLI_TRUST_WORKSPACE":"true"'),
-      false,
-    );
+    assert.equal(JSON.stringify(report).includes('"GEMINI_CLI_TRUST_WORKSPACE":"true"'), false);
   } finally {
     f.cleanup();
   }
@@ -285,10 +273,7 @@ test('preflight blocks proxy keys found only in the selected env file', () => {
     assert.equal(report.allowed, false);
     assert.ok(report.blockers.includes('selected-env-proxy-present'));
     assert.equal(report.selectedEnv.proxy.HTTPS_PROXY, true);
-    assert.equal(
-      JSON.stringify(report).includes('selected-proxy-secret.example'),
-      false,
-    );
+    assert.equal(JSON.stringify(report).includes('selected-proxy-secret.example'), false);
   } finally {
     f.cleanup();
   }
@@ -365,21 +350,15 @@ test('workspace ignoreLocalEnv participates only when the workspace is trusted',
 test('CLI emits a safe report and uses exit 2 for a blocked proxy environment', () => {
   const f = fixture();
   try {
-    const cliPath = fileURLToPath(
-      new URL('../bin/phase-b-preflight.mjs', import.meta.url),
-    );
-    const result = spawnSync(
-      process.execPath,
-      [cliPath, '--workspace', f.workspace],
-      {
-        encoding: 'utf8',
-        env: {
-          PATH: process.env.PATH,
-          GEMINI_CLI_HOME: f.home,
-          HTTPS_PROXY: 'http://cli-secret-proxy.example:9999',
-        },
+    const cliPath = fileURLToPath(new URL('../bin/phase-b-preflight.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [cliPath, '--workspace', f.workspace], {
+      encoding: 'utf8',
+      env: {
+        PATH: process.env.PATH,
+        GEMINI_CLI_HOME: f.home,
+        HTTPS_PROXY: 'http://cli-secret-proxy.example:9999',
       },
-    );
+    });
     assert.equal(result.status, 2);
     assert.equal(result.stderr, '');
     const report = JSON.parse(result.stdout);
