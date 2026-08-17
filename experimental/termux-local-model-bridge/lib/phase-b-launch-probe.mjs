@@ -75,9 +75,15 @@ function requireTimeoutMs(value) {
 
 function readRegularFileNoFollow(filePath, maxBytes, label) {
   const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  // O_NONBLOCK: opening a FIFO for O_RDONLY alone blocks until a writer
+  // opens the other end, hanging this call (and the whole probe) forever if
+  // geminiRoot's package.json is replaced with a FIFO. Non-blocking open has
+  // no effect on reads from a genuine regular file, and the isFile() check
+  // right below still rejects a FIFO immediately once opened. Matches the
+  // O_NONBLOCK pattern already used by this same file's bin/ CLI wrapper.
   const descriptor = fs.openSync(
     filePath,
-    fs.constants.O_RDONLY | noFollow,
+    fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | noFollow,
   );
   try {
     const stat = fs.fstatSync(descriptor);
@@ -157,7 +163,32 @@ export function resolvePinnedGeminiDistribution(geminiRoot) {
   return Object.freeze({
     root: realRoot,
     entrypoint,
+    entrypointIdentity: Object.freeze({
+      dev: entryStat.dev,
+      ino: entryStat.ino,
+    }),
   });
+}
+
+// child_process.spawn() takes the executable as a path string re-resolved by
+// the OS at spawn time, not a held descriptor -- Node has no exec-by-fd
+// primitive, so the window between resolvePinnedGeminiDistribution's checks
+// and the actual spawn() call below can be narrowed but not eliminated by
+// this API. Re-checking the entrypoint's identity as the very last thing
+// before spawn (after the recorder/runtime setup that would otherwise sit
+// inside the exposed window) keeps that window to a handful of synchronous
+// statements.
+export function reverifyPinnedEntrypoint(distribution) {
+  const stat = fs.lstatSync(distribution.entrypoint);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    fail('Gemini entrypoint changed before spawn');
+  }
+  if (
+    stat.dev !== distribution.entrypointIdentity.dev ||
+    stat.ino !== distribution.entrypointIdentity.ino
+  ) {
+    fail('Gemini entrypoint identity changed before spawn');
+  }
 }
 
 function buildLaunchContract(preflightReport, recorderOrigin) {
@@ -329,8 +360,9 @@ export async function runPhaseBLaunchProbe(options) {
       tempParent,
     });
 
-    // This is the last state check before the first real process spawn.
+    // These are the last state checks before the first real process spawn.
     verifyPhaseBRuntime(runtime);
+    reverifyPinnedEntrypoint(distribution);
 
     const childEnvironment = buildLaunchEnvironment(runtime);
     const launcherArgs = Object.freeze([

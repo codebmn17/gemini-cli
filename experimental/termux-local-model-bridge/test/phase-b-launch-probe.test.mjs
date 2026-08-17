@@ -3,9 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { execFileSync } from 'node:child_process';
 import {
   HARMLESS_PROBE_PROMPT,
   resolvePinnedGeminiDistribution,
+  reverifyPinnedEntrypoint,
   runPhaseBLaunchProbe,
 } from '../lib/phase-b-launch-probe.mjs';
 import {
@@ -142,6 +144,73 @@ test('rejects an unreviewed Gemini package version before spawn', () => {
     assert.throws(
       () => resolvePinnedGeminiDistribution(geminiRoot),
       /version does not match/,
+    );
+  } finally {
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+test('rejects a FIFO package.json without hanging', { timeout: 5000 }, () => {
+  const tempParent = makeTempParent();
+  try {
+    const geminiRoot = makeDistribution(tempParent, 'process.exit(0);');
+    fs.unlinkSync(path.join(geminiRoot, 'package.json'));
+    try {
+      execFileSync('mkfifo', [path.join(geminiRoot, 'package.json')]);
+    } catch {
+      return; // mkfifo unavailable on this platform/filesystem; skip.
+    }
+    const start = Date.now();
+    assert.throws(
+      () => resolvePinnedGeminiDistribution(geminiRoot),
+      /must be a regular file/,
+    );
+    assert.ok(
+      Date.now() - start < 2000,
+      'must fail fast, not block on the FIFO open',
+    );
+  } finally {
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+test('reverifyPinnedEntrypoint accepts an unchanged distribution and rejects a swapped one', () => {
+  const tempParent = makeTempParent();
+  try {
+    const geminiRoot = makeDistribution(tempParent, 'process.exit(0);');
+    const distribution = resolvePinnedGeminiDistribution(geminiRoot);
+    assert.doesNotThrow(() => reverifyPinnedEntrypoint(distribution));
+
+    // Simulate an entrypoint swap that happens after resolution (the window
+    // between resolvePinnedGeminiDistribution's checks and the actual spawn
+    // call, which child_process.spawn's path-based API cannot close outright
+    // since Node has no exec-by-descriptor primitive). Written elsewhere then
+    // renamed into place, the standard atomic-replace idiom and the only way
+    // to reliably force a different inode: this filesystem reuses the same
+    // inode for a plain unlink()-then-recreate() at the same path.
+    const replacement = path.join(geminiRoot, 'swapped-content.js');
+    fs.writeFileSync(replacement, '// swapped after validation');
+    fs.renameSync(replacement, distribution.entrypoint);
+    assert.throws(
+      () => reverifyPinnedEntrypoint(distribution),
+      /entrypoint identity changed before spawn/,
+    );
+  } finally {
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+test('reverifyPinnedEntrypoint rejects the entrypoint becoming a symlink after resolution', () => {
+  const tempParent = makeTempParent();
+  try {
+    const geminiRoot = makeDistribution(tempParent, 'process.exit(0);');
+    const distribution = resolvePinnedGeminiDistribution(geminiRoot);
+    const target = path.join(geminiRoot, 'swapped-target.js');
+    fs.renameSync(distribution.entrypoint, target);
+    fs.symlinkSync(target, distribution.entrypoint);
+    assert.throws(
+      () => reverifyPinnedEntrypoint(distribution),
+      /entrypoint changed before spawn/,
     );
   } finally {
     fs.rmSync(tempParent, { recursive: true, force: true });
