@@ -213,8 +213,16 @@ function createBoundedCapture(stream) {
     });
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function raceWithTimeout(promise, timeoutMs) {
+  let timer;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function terminateChild(child, exitPromise) {
@@ -222,19 +230,13 @@ async function terminateChild(child, exitPromise) {
     child.kill('SIGTERM');
   }
 
-  let result = await Promise.race([
-    exitPromise,
-    delay(TERMINATION_GRACE_MS).then(() => null),
-  ]);
+  let result = await raceWithTimeout(exitPromise, TERMINATION_GRACE_MS);
   if (result !== null) return result;
 
   if (child.exitCode === null && child.signalCode === null) {
     child.kill('SIGKILL');
   }
-  result = await Promise.race([
-    exitPromise,
-    delay(TERMINATION_GRACE_MS).then(() => null),
-  ]);
+  result = await raceWithTimeout(exitPromise, TERMINATION_GRACE_MS);
   if (result === null) {
     fail('Gemini child did not terminate after SIGKILL');
   }
@@ -364,12 +366,20 @@ export async function runPhaseBLaunchProbe(options) {
       });
     });
 
-    const timeoutPromise = delay(timeoutMs).then(() => ({ kind: 'timeout' }));
-    const firstOutcome = await Promise.race([
-      firstRecordPromise,
-      exitPromise,
-      timeoutPromise,
-    ]);
+    let launchTimeout;
+    const timeoutPromise = new Promise((resolve) => {
+      launchTimeout = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+    });
+    let firstOutcome;
+    try {
+      firstOutcome = await Promise.race([
+        firstRecordPromise,
+        exitPromise,
+        timeoutPromise,
+      ]);
+    } finally {
+      clearTimeout(launchTimeout);
+    }
 
     if (firstOutcome.kind === 'spawn-error') {
       fail('Gemini child failed to spawn');
