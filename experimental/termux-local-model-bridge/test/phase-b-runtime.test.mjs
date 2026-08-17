@@ -37,7 +37,7 @@ function modeBits(filePath) {
   return fs.statSync(filePath).mode & 0o777;
 }
 
-test('accepts both reviewed auth-routing candidates and rejects a tampered contract', () => {
+test('accepts both reviewed auth-routing candidates and rejects approval-policy tampering', () => {
   assert.equal(validateAuthRoutingContractForRuntime(buildContract()), true);
   assert.equal(
     validateAuthRoutingContractForRuntime(buildContract(AUTH_CANDIDATES.GATEWAY)),
@@ -55,6 +55,27 @@ test('accepts both reviewed auth-routing candidates and rejects a tampered contr
   const allowedTool = structuredClone(buildContract());
   allowedTool.isolatedSettings.tools.allowed = ['run_shell_command(git)'];
   assert.throws(() => validateAuthRoutingContractForRuntime(allowedTool));
+});
+
+test('rejects tampering with the recorder endpoint, placeholder key, mask set, or runtime bindings', () => {
+  const externalBaseUrl = structuredClone(buildContract());
+  externalBaseUrl.childEnvironment.set.GOOGLE_GEMINI_BASE_URL =
+    'https://generativelanguage.googleapis.com';
+  assert.throws(() => validateAuthRoutingContractForRuntime(externalBaseUrl));
+
+  const realKey = structuredClone(buildContract());
+  realKey.childEnvironment.set.GEMINI_API_KEY = 'REAL_KEY_MUST_NEVER_FLOW';
+  assert.throws(() => validateAuthRoutingContractForRuntime(realKey));
+
+  const missingMask = structuredClone(buildContract());
+  missingMask.childEnvironment.maskToEmpty = missingMask.childEnvironment.maskToEmpty.filter(
+    (key) => key !== 'GOOGLE_API_KEY',
+  );
+  assert.throws(() => validateAuthRoutingContractForRuntime(missingMask));
+
+  const extraBinding = structuredClone(buildContract());
+  extraBinding.childEnvironment.runtimeBindings.HOME = '/real/home';
+  assert.throws(() => validateAuthRoutingContractForRuntime(extraBinding));
 });
 
 test('materializes a fresh private runtime with empty cwd and exact isolated settings', () => {
@@ -95,6 +116,23 @@ test('materializes a fresh private runtime with empty cwd and exact isolated set
   }
 });
 
+test('default materialization accepts Node process.env rather than requiring a plain object prototype', () => {
+  const tempParent = makeTempParent();
+  let runtime;
+  try {
+    assert.notEqual(Object.getPrototypeOf(process.env), Object.prototype);
+    runtime = materializePhaseBRuntime({
+      contract: buildContract(),
+      tempParent,
+    });
+    assert.equal(runtime.childEnvironment.GEMINI_API_KEY, LOCAL_PLACEHOLDER_API_KEY);
+    assert.equal(runtime.childEnvironment.GEMINI_CLI_HOME, runtime.geminiHome);
+  } finally {
+    if (runtime) cleanupPhaseBRuntime(runtime);
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
 test('builds child environment in copy-mask-set-runtime order without mutating parent', () => {
   const tempParent = makeTempParent();
   let runtime;
@@ -117,6 +155,7 @@ test('builds child environment in copy-mask-set-runtime order without mutating p
     });
 
     assert.deepEqual(parentEnv, originalParent);
+    assert.equal(Object.getPrototypeOf(runtime.childEnvironment), null);
     assert.equal(runtime.childEnvironment.KEEP_ME, 'kept');
     assert.equal(runtime.childEnvironment.GOOGLE_API_KEY, '');
     assert.equal(runtime.childEnvironment.HTTPS_PROXY, '');
