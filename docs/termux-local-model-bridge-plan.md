@@ -118,12 +118,15 @@ auth method for a normal (non-`--acp`) invocation:
   interactive REPL or the plain non-interactive `-p`/piped flow this plan's
   `gemini-local` wrapper targets.
 
-Net effect: the `GATEWAY` empty-key behavior is real, but reaching it through
-the ordinary `gemini` invocation (interactive or non-interactive) requires the
-wrapper to also control `security.auth.useExternal` and, for interactive mode,
-`security.auth.selectedType`, through a settings layer — not through
-`GOOGLE_GEMINI_BASE_URL` and `GEMINI_TELEMETRY_ENABLED` alone. This is a gap in
-the plan's original wrapper contract, addressed below.
+Net effect: the `GATEWAY` empty-key behavior is real, but on a device with a
+persisted auth method the ordinary `gemini` invocation requires the wrapper to
+control both `security.auth.useExternal` and
+`security.auth.selectedType: "gateway"` through a settings layer for both
+interactive and non-interactive local-mode runs. In non-interactive mode the
+persisted `configuredAuthType` otherwise wins before `getAuthTypeFromEnv()` is
+consulted; in interactive mode the environment never selects the auth type at
+all. `GOOGLE_GEMINI_BASE_URL` and `GEMINI_TELEMETRY_ENABLED` alone are therefore
+insufficient for this target.
 
 The `v0.55.1` configuration reference (`docs/reference/configuration.md`) also
 documents `GOOGLE_GEMINI_BASE_URL` as a supported Gemini API base URL override
@@ -134,6 +137,17 @@ reference text itself frames this override as applying "when using
 evidence that `USE_GEMINI` with a placeholder key, not `GATEWAY`, is the
 documented, tested route to a custom `baseUrl` for a normal `gemini`
 invocation — see the revised wrapper contract below.
+
+`packages/cli/src/config/settings.ts` adds an independent settings-isolation
+constraint. `GEMINI_CLI_SYSTEM_SETTINGS_PATH` replaces the native system
+settings path. Unless `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` is also explicitly set,
+`getSystemDefaultsPath()` derives the system-defaults path from the directory of
+that replacement. The merge order gives System Settings the highest file-based
+precedence after schema defaults, system defaults, user settings, and workspace
+settings. A bridge-owned system-settings file can therefore override the user's
+saved auth selection, but it must never silently hide an existing native system
+settings or system-defaults layer. Phase B must resolve those native paths and
+record whether the files exist before any override is used.
 
 ### Upstream-tracking branch pin
 
@@ -224,6 +238,8 @@ Every implementation and review pass must preserve these invariants.
 13. The reviewed implementation SHA must match the locally installed artifacts.
 14. Upstream compatibility is tested at version boundaries instead of preserved
     by carrying a long-lived source fork.
+15. Local mode must not weaken or silently replace existing system settings,
+    system defaults, approval policy, authentication policy, or security policy.
 
 ## Local installation layout
 
@@ -241,11 +257,11 @@ Git branch. Exact paths remain configurable, but this is the preferred layout:
   local-mode-settings.json
 ```
 
-We recommend the bridge implementation prefer Node.js because Node.js is
-already a `Gemini CLI` requirement on all target machines and modern Node
-provides native HTTP, `fetch`, streams, and abort signals. A Python
-implementation remains acceptable only if review proves it materially reduces
-complexity without adding brittle dependencies.
+We recommend using Node.js for the bridge because Node.js is already a
+`Gemini CLI` requirement on all target machines and modern Node provides native
+HTTP, `fetch`, streams, and abort signals. A Python implementation remains
+acceptable only if review proves it materially reduces complexity without
+adding brittle dependencies.
 
 The installation must not modify `~/.gemini/GEMINI.md`. Launching the same
 `gemini` executable naturally retains the user's existing global context,
@@ -276,6 +292,16 @@ mode never derives an auth type from the environment at all). The device
 target already has a working, persisted `gemini` installation, so a persisted
 `security.auth.selectedType` must be assumed present, not absent.
 
+A bridge-owned `GEMINI_CLI_SYSTEM_SETTINGS_PATH` is permitted only after Phase B
+resolves the native system-settings and system-defaults paths with both override
+environment variables unset and records whether those files exist. If either
+native file exists, local mode must fail closed before replacing the path until
+a separately reviewed preservation/composition strategy proves that the native
+settings and defaults remain effective. The wrapper must not weaken existing
+approval, authentication, admin, workspace, or security policy merely to enable
+local inference. Remote admin controls remain owned by `Gemini CLI`; this plan
+does not claim the file-path override changes their behavior.
+
 The first implementation must therefore test two candidate minimal
 environments and record which one, if either, actually reaches the bridge for
 both interactive and non-interactive invocation, rather than assuming the
@@ -300,16 +326,18 @@ Google credential, and the bridge does not need to honor it as a real key; the
 bridge can additionally check for this exact placeholder as a defense against
 stray loopback traffic from other local processes.
 
-Candidate 2 (`GATEWAY` route): the same
-`GEMINI_CLI_SYSTEM_SETTINGS_PATH`-referenced settings file additionally sets
-`security.auth.useExternal: true` and, for interactive mode,
-`security.auth.selectedType: "gateway"`, with no `GEMINI_API_KEY` set. This
-matches the plan's original intent of never requiring a placeholder credential,
-but depends on settings-layer behavior (`useExternal` bypassing
-`validateAuthMethod()`, and a higher-precedence settings layer overriding an
-already-persisted `selectedType`) that must be device-verified before it is
-trusted, since it is not covered by the project's own auth test suites for the
-non-`--acp` invocation path.
+Candidate 2 (`GATEWAY` route): the same process-scoped bridge-owned settings file
+sets both `security.auth.useExternal: true` and
+`security.auth.selectedType: "gateway"` for interactive and non-interactive
+local-mode invocations, with no `GEMINI_API_KEY` set. Both settings are required
+on the target device because an already-persisted selected auth type wins before
+`getAuthTypeFromEnv()` in non-interactive mode and is read directly in
+interactive mode. This matches the plan's original intent of never requiring a
+placeholder credential, but depends on settings-layer behavior (`useExternal`
+bypassing `validateAuthMethod()` and the higher-precedence system settings layer
+overriding the persisted selected type) that must be device-verified before it
+is trusted, since it is not covered by the project's own auth test suites for
+the non-`--acp` invocation path.
 
 Phase B must run both candidates against the installed `0.55.1` binary and
 record which one actually reaches the loopback recorder, in both interactive
@@ -617,6 +645,7 @@ Acceptance requires proving that:
 - no npm package file is modified,
 - no Google auth file is modified,
 - no `~/.gemini/GEMINI.md` content is rewritten,
+- existing native system settings and system defaults remain effective,
 - deleting the local bridge files removes local mode without repairing
   `Gemini CLI` itself.
 
@@ -659,6 +688,8 @@ Every failure mode must be designed before happy-path polish.
 - Media on text-only model: bridge rejects the unsupported content.
 - Missing token-count support: bridge does not invent exact token usage.
 - Local profile missing: wrapper fails before launching `gemini`.
+- Existing system settings/defaults would be shadowed: wrapper fails before
+  launching local mode until a reviewed preservation strategy exists.
 
 No local-mode failure may silently retry against a Google model endpoint.
 
@@ -683,20 +714,32 @@ Completion proof:
 Build the smallest disposable loopback recorder needed to observe requests from
 installed `Gemini CLI` `0.55.1`. It must sanitize all captured data.
 
-Test in this order:
+Before any settings-path override or auth candidate is attempted:
+
+1. Resolve the native system-settings path with
+   `GEMINI_CLI_SYSTEM_SETTINGS_PATH` unset.
+2. Resolve the native system-defaults path with both
+   `GEMINI_CLI_SYSTEM_SETTINGS_PATH` and
+   `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` unset.
+3. Record whether either native file exists without modifying it.
+4. If either file exists, stop the candidate probe and return to review until a
+   preservation/composition strategy is accepted. Do not replace an existing
+   system policy/settings layer for the sake of local mode.
+
+Once that prerequisite is satisfied, test in this order:
 
 1. Launch a recorder on `127.0.0.1`.
-2. Start `Gemini CLI` non-interactively with only `GOOGLE_GEMINI_BASE_URL`
-   redirected locally and no persisted auth method, and confirm whether it
-   reaches the recorder or exits with an authentication error.
-3. If step 2 exits with an authentication error, retry with the `USE_GEMINI`
-   candidate (placeholder `GEMINI_API_KEY` plus `selectedType:
-   "gemini-api-key"`) and, separately, the `GATEWAY` candidate
-   (`security.auth.useExternal: true`), and record which one, if either,
-   reaches the recorder.
-4. Repeat steps 2 and 3 for an interactive session, since interactive startup
-   does not derive an auth type from the environment at all and needs its own
-   proof independent of the non-interactive result.
+2. Run the documented `USE_GEMINI` candidate non-interactively with the
+   bridge-owned settings layer forcing `selectedType: "gemini-api-key"`, a
+   wrapper-owned placeholder `GEMINI_API_KEY`, and the base URL redirected to
+   the recorder.
+3. Separately run the `GATEWAY` candidate non-interactively with the bridge-owned
+   settings layer forcing both `security.auth.useExternal: true` and
+   `security.auth.selectedType: "gateway"`, no `GEMINI_API_KEY`, and the base URL
+   redirected to the recorder. The probe must not inherit the persisted hosted
+   auth type.
+4. Repeat candidates 2 and 3 for an interactive session, since interactive
+   startup has its own auth path and needs independent proof.
 5. Issue a harmless prompt that reaches the recorder.
 6. Record method, path, selected safe headers, and request shape.
 7. Return a deliberate local error or static response.
@@ -712,8 +755,11 @@ candidate works before this test records the result.
 
 Completion proof:
 
-- the auth candidate that reaches the recorder is recorded for both
-  interactive and non-interactive mode,
+- native system-settings and system-defaults paths and file-existence results are
+  recorded,
+- no existing native system policy/settings layer was silently replaced,
+- the auth candidate that reaches the recorder is recorded for both interactive
+  and non-interactive mode,
 - exact request paths are recorded,
 - actual auth/header behavior is recorded,
 - normal `gemini` remains unchanged,
@@ -832,9 +878,15 @@ strictly offline beyond model inference.
 
 Install only artifacts that match the accepted review SHA.
 
+Before deleting the implementation branch, create and push a dedicated annotated
+review tag that points exactly to the accepted implementation commit. Treat that
+tag as immutable review evidence: never move or reuse it for a different commit.
+The tag does not merge anything into `main` and is not a distribution claim.
+
 The installation report must record:
 
 - accepted implementation commit SHA,
+- reviewed Git tag name,
 - installed `Gemini CLI` version,
 - bridge version or commit,
 - backend profile,
@@ -980,12 +1032,19 @@ Use this sequence:
    see only implementation changes relative to the accepted plan.
 5. Run independent implementation and adversarial review passes.
 6. Record the final accepted implementation SHA.
-7. Copy/install that exact reviewed artifact set locally.
-8. Verify local file hashes or content against the accepted commit.
-9. Close the implementation PR unmerged.
-10. Close the plan PR unmerged.
-11. Delete both temporary branches after the local installation is verified.
-12. Keep the closed PRs as historical review evidence.
+7. Create and push a dedicated annotated reviewed tag at that exact SHA and
+   never move or reuse the tag.
+8. Copy/install that exact reviewed artifact set locally.
+9. Verify local file hashes or content against the accepted commit and tag.
+10. Close the implementation PR unmerged.
+11. Close the plan PR unmerged.
+12. Delete both temporary branches after the local installation is verified.
+13. Keep the reviewed tag and closed PRs as historical review evidence.
+
+The reviewed tag is a durable Git-native anchor for reproduction after the
+implementation branch is deleted. It records review identity only; it does not
+merge the customization into `main` or turn the fork into the distribution
+channel.
 
 If upstream `main` changes during review, do not casually rebase and invalidate
 review evidence. Reconcile only when the upstream change affects a bridge seam or
@@ -1033,9 +1092,11 @@ Required for Termux:
 - Token counting is real for the active model or the unsupported state is
   explicit.
 - Bridge/backend failures cannot fall back to Google.
+- Existing native system settings/defaults remain effective.
 - Secrets and prompts are not logged by default.
 - Local bridge files are removable without repairing `Gemini CLI`.
 - Installed local artifacts match the accepted review SHA.
+- A dedicated reviewed tag still points to that accepted implementation SHA.
 
 Required before claiming broader compatibility:
 
@@ -1069,6 +1130,8 @@ Stop implementation and return to planning if any of these conditions occur.
 - Local mode requires modifying official package files.
 - Normal `gemini` behavior changes as a side effect.
 - The bridge must receive or persist a real Google credential.
+- Local mode would need to shadow existing native system settings/defaults
+  without an accepted preservation/composition strategy.
 - A required `Gemini CLI` feature depends on an untranslatable private protocol.
 - Tool confirmation would need to be bypassed to make a local model work.
 - The selected backend cannot provide reliable tool-call structure for the
