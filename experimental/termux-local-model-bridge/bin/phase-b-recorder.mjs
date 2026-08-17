@@ -10,7 +10,11 @@ function parseInteger(value, label) {
   if (!/^(0|[1-9]\d*)$/.test(value)) {
     throw new Error(`${label} must be a decimal integer`);
   }
-  return Number(value);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${label} must be a safe decimal integer`);
+  }
+  return parsed;
 }
 
 function parsePositiveInt(value, label) {
