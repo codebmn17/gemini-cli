@@ -71,20 +71,69 @@ Official release `v0.55.1` is pinned at commit
 At `v0.55.1`, `packages/core/src/core/contentGenerator.ts` provides the source
 contract that matters most to this plan:
 
-- `GOOGLE_GEMINI_BASE_URL` selects `AuthType.GATEWAY` before
-  `GEMINI_API_KEY`-based auth selection.
-- `AuthType.GATEWAY` accepts an empty API key.
-- The gateway path constructs the normal `GoogleGenAI` client with a custom
-  `baseUrl`.
-- When the gateway API key is empty, the source explicitly adds an empty
-  `x-goog-api-key` header rather than requiring a real Google credential.
+- `getAuthTypeFromEnv()` selects `AuthType.GATEWAY` when `GOOGLE_GEMINI_BASE_URL`
+  is set and takes precedence there over `GEMINI_API_KEY`-based selection.
+- Inside the `GATEWAY` branch of `createContentGenerator()`, an empty API key is
+  accepted: the gateway path constructs the normal `GoogleGenAI` client with a
+  custom `baseUrl`, and when the gateway API key is empty the source explicitly
+  adds an empty `x-goog-api-key` header rather than requiring a real Google
+  credential. The `@google/genai@1.30.0` client (`GoogleGenAI` and `NodeAuth` in
+  `dist/node/index.cjs`) does not throw on an empty API key at construction or
+  header-attachment time.
 - `ContentGenerator` exposes four model-facing operations:
   `generateContent()`, `generateContentStream()`, `countTokens()`, and
   `embedContent()`.
 
-The `v0.55.1` configuration reference also documents
-`GOOGLE_GEMINI_BASE_URL` as a supported Gemini API base URL override and allows
-plain HTTP for `localhost`, `127.0.0.1`, and `[::1]`.
+This confirms the `GATEWAY` branch itself is empty-key-safe, but it does not by
+itself prove that a normal `gemini` invocation ever reaches that branch. A
+separate, higher layer in `packages/cli` gates which `AuthType` value the
+process actually uses, and that layer does not treat `GATEWAY` as a supported
+auth method for a normal (non-`--acp`) invocation:
+
+- `getAuthTypeFromEnv()` is called only from
+  `packages/cli/src/validateNonInteractiveAuth.ts`, and only as a fallback:
+  `configuredAuthType || getAuthTypeFromEnv()`, where `configuredAuthType` is
+  `settings.merged.security.auth.selectedType`. If the device has any
+  persisted auth method (the expected state for the target Termux device,
+  which is already used daily), that persisted value wins and
+  `GOOGLE_GEMINI_BASE_URL` is never used to select `GATEWAY`.
+- Interactive startup (`packages/cli/src/gemini.tsx`,
+  `packages/cli/src/ui/auth/useAuth.ts`) never calls `getAuthTypeFromEnv()` at
+  all. It reads `settings.merged.security.auth.selectedType` directly, so
+  environment variables cannot select an auth type for an interactive session
+  by themselves.
+- Even when `AuthType.GATEWAY` is reached (persisted `selectedType` unset, in
+  non-interactive mode, with `GOOGLE_GEMINI_BASE_URL` set),
+  `packages/cli/src/config/auth.ts`'s `validateAuthMethod()` has explicit
+  branches only for `LOGIN_WITH_GOOGLE`, `COMPUTE_ADC`, `USE_GEMINI`, and
+  `USE_VERTEX_AI`. Any other value, including `GATEWAY`, falls through to
+  `return 'Invalid auth method selected.'`, and `gemini.tsx` treats that as a
+  fatal authentication error. This validation call is skipped only when
+  `settings.merged.security.auth.useExternal` is `true` — a persisted setting,
+  not an environment variable.
+- The only in-source call sites that construct and use `AuthType.GATEWAY`
+  without going through `validateAuthMethod()` are
+  `packages/cli/src/acp/acpSessionManager.ts` and `acpRpcDispatcher.ts`, which
+  belong to the Agent Client Protocol (`gemini --acp`) surface, not the
+  interactive REPL or the plain non-interactive `-p`/piped flow this plan's
+  `gemini-local` wrapper targets.
+
+Net effect: the `GATEWAY` empty-key behavior is real, but reaching it through
+the ordinary `gemini` invocation (interactive or non-interactive) requires the
+wrapper to also control `security.auth.useExternal` and, for interactive mode,
+`security.auth.selectedType`, through a settings layer — not through
+`GOOGLE_GEMINI_BASE_URL` and `GEMINI_TELEMETRY_ENABLED` alone. This is a gap in
+the plan's original wrapper contract, addressed below.
+
+The `v0.55.1` configuration reference (`docs/reference/configuration.md`) also
+documents `GOOGLE_GEMINI_BASE_URL` as a supported Gemini API base URL override
+and allows plain HTTP for `localhost`, `127.0.0.1`, and `[::1]`, but the
+reference text itself frames this override as applying "when using
+`gemini-api-key` authentication" (`AuthType.USE_GEMINI`). It does not document
+`GATEWAY` as a supported end-user auth method at all. This is corroborating
+evidence that `USE_GEMINI` with a placeholder key, not `GATEWAY`, is the
+documented, tested route to a custom `baseUrl` for a normal `gemini`
+invocation — see the revised wrapper contract below.
 
 ### Upstream-tracking branch pin
 
@@ -192,14 +241,14 @@ Git branch. Exact paths remain configurable, but this is the preferred layout:
   local-mode-settings.json
 ```
 
-The bridge implementation should prefer Node.js because Node.js is already a
-`Gemini CLI` requirement on all target machines and modern Node provides native
-HTTP, `fetch`, streams, and abort signals. A Python implementation remains
-acceptable only if review proves it materially reduces complexity without
-adding brittle dependencies.
+We recommend the bridge implementation prefer Node.js because Node.js is
+already a `Gemini CLI` requirement on all target machines and modern Node
+provides native HTTP, `fetch`, streams, and abort signals. A Python
+implementation remains acceptable only if review proves it materially reduces
+complexity without adding brittle dependencies.
 
 The installation must not modify `~/.gemini/GEMINI.md`. Launching the same
-`gemini` executable should naturally retain the user's existing global context,
+`gemini` executable naturally retains the user's existing global context,
 skills, policies, settings layers, and workspace behavior. Local-mode-specific
 overrides belong in process-scoped environment variables or a bridge-owned
 settings file.
@@ -217,23 +266,60 @@ Expected inputs include:
 - an optional local model/profile selection,
 - normal `Gemini CLI` arguments passed through unchanged.
 
-The first implementation must test this minimal environment before adding any
-fallback credential behavior:
+Environment variables alone are not sufficient. As detailed in the stable-source
+pin evidence above, a normal (non-`--acp`) `gemini` invocation only reaches
+`AuthType.GATEWAY` in the narrow case where no auth method is already persisted
+in settings, the process is non-interactive, and
+`security.auth.useExternal` is separately set to `true` in a settings layer
+(`validateAuthMethod()` otherwise rejects `GATEWAY` outright, and interactive
+mode never derives an auth type from the environment at all). The device
+target already has a working, persisted `gemini` installation, so a persisted
+`security.auth.selectedType` must be assumed present, not absent.
+
+The first implementation must therefore test two candidate minimal
+environments and record which one, if either, actually reaches the bridge for
+both interactive and non-interactive invocation, rather than assuming the
+simpler one works:
+
+Candidate 1 (documented, `USE_GEMINI` route):
 
 ```text
 GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<bridge-port>
 GEMINI_TELEMETRY_ENABLED=0
+GEMINI_API_KEY=<local-placeholder-value>
 ```
 
-Do not set a dummy `GEMINI_API_KEY` by default. The `v0.55.1` gateway source path
-supports an empty API key. A placeholder key can be added only if the actual
-device contract probe proves the installed bundle requires one.
+with a bridge-owned settings file (pointed to by
+`GEMINI_CLI_SYSTEM_SETTINGS_PATH`, process-scoped) that sets
+`security.auth.selectedType` to `gemini-api-key`. This is the auth type the
+`v0.55.1` configuration reference documents `GOOGLE_GEMINI_BASE_URL` against,
+it has an explicit, passing branch in `validateAuthMethod()`, and it reaches
+the same `baseUrl`-override code in `contentGenerator.ts` that the `GATEWAY`
+branch uses. The placeholder value is chosen by the wrapper, never a real
+Google credential, and the bridge does not need to honor it as a real key; the
+bridge can additionally check for this exact placeholder as a defense against
+stray loopback traffic from other local processes.
 
-For a stricter local posture, the wrapper can point
-`GEMINI_CLI_SYSTEM_SETTINGS_PATH` to a bridge-owned settings file that disables
-update behavior or other network-oriented features. That remains evidence-gated:
-we must first verify the installed version respects the override without
-changing unrelated user settings.
+Candidate 2 (`GATEWAY` route): the same
+`GEMINI_CLI_SYSTEM_SETTINGS_PATH`-referenced settings file additionally sets
+`security.auth.useExternal: true` and, for interactive mode,
+`security.auth.selectedType: "gateway"`, with no `GEMINI_API_KEY` set. This
+matches the plan's original intent of never requiring a placeholder credential,
+but depends on settings-layer behavior (`useExternal` bypassing
+`validateAuthMethod()`, and a higher-precedence settings layer overriding an
+already-persisted `selectedType`) that must be device-verified before it is
+trusted, since it is not covered by the project's own auth test suites for the
+non-`--acp` invocation path.
+
+Phase B must run both candidates against the installed `0.55.1` binary and
+record which one actually reaches the loopback recorder, in both interactive
+and non-interactive mode, before the wrapper contract is finalized.
+
+For a stricter local posture, the same bridge-owned settings file referenced by
+`GEMINI_CLI_SYSTEM_SETTINGS_PATH` can also disable update behavior or other
+network-oriented features. That remains evidence-gated: we must first verify
+the installed version respects the override without changing unrelated user
+settings.
 
 No wrapper variable may be exported into the caller's shell after `gemini-local`
 exits.
@@ -258,7 +344,7 @@ embedContent
 ```
 
 Do not freeze exact paths for those two operations until the localhost contract
-probe records the installed `0.55.1` requests. The bridge router should support
+probe records the installed `0.55.1` requests. The bridge router must support
 the API version actually received rather than hard-coding `v1beta` throughout
 its internal logic.
 
@@ -600,22 +686,34 @@ installed `Gemini CLI` `0.55.1`. It must sanitize all captured data.
 Test in this order:
 
 1. Launch a recorder on `127.0.0.1`.
-2. Start `Gemini CLI` with only `GOOGLE_GEMINI_BASE_URL` redirected locally.
-3. Do not provide a real Google API key.
-4. Issue a harmless prompt that reaches the recorder.
-5. Record method, path, selected safe headers, and request shape.
-6. Return a deliberate local error or static response.
-7. Confirm no hosted model request was needed for the proof.
-8. Repeat for streaming.
-9. Trigger representative flows that reveal `countTokens` and embedding usage.
-10. Record cancellation behavior.
+2. Start `Gemini CLI` non-interactively with only `GOOGLE_GEMINI_BASE_URL`
+   redirected locally and no persisted auth method, and confirm whether it
+   reaches the recorder or exits with an authentication error.
+3. If step 2 exits with an authentication error, retry with the `USE_GEMINI`
+   candidate (placeholder `GEMINI_API_KEY` plus `selectedType:
+   "gemini-api-key"`) and, separately, the `GATEWAY` candidate
+   (`security.auth.useExternal: true`), and record which one, if either,
+   reaches the recorder.
+4. Repeat steps 2 and 3 for an interactive session, since interactive startup
+   does not derive an auth type from the environment at all and needs its own
+   proof independent of the non-interactive result.
+5. Issue a harmless prompt that reaches the recorder.
+6. Record method, path, selected safe headers, and request shape.
+7. Return a deliberate local error or static response.
+8. Confirm no hosted model request was needed for the proof.
+9. Repeat for streaming.
+10. Trigger representative flows that reveal `countTokens` and embedding usage.
+11. Record cancellation behavior.
 
-This phase decides whether an empty gateway key works in the installed bundle.
-Only add a dummy local key if this empirical test disproves the source-derived
-expectation.
+This phase decides which auth candidate from the wrapper contract actually
+reaches the installed bundle, in both interactive and non-interactive mode, and
+whether an empty or placeholder key is required. Do not assume either
+candidate works before this test records the result.
 
 Completion proof:
 
+- the auth candidate that reaches the recorder is recorded for both
+  interactive and non-interactive mode,
 - exact request paths are recorded,
 - actual auth/header behavior is recorded,
 - normal `gemini` remains unchanged,
@@ -778,7 +876,7 @@ the path is deliberately synthetic.
 ### Translator tests
 
 Verify request and response conversion as pure data transformations whenever
-possible. Network tests should focus on transport behavior rather than repeating
+possible. Network tests must focus on transport behavior rather than repeating
 all conversion cases.
 
 Important regressions include:
