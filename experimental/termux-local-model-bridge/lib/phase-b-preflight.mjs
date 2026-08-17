@@ -161,9 +161,7 @@ function readJsonObject(filePath, fsApi = fs) {
   }
 
   try {
-    const parsed = JSON.parse(
-      stripJsonComments(fsApi.readFileSync(filePath, 'utf8')),
-    );
+    const parsed = JSON.parse(stripJsonComments(fsApi.readFileSync(filePath, 'utf8')));
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       return { status: 'invalid', value: {} };
     }
@@ -211,11 +209,7 @@ function normalizePathForPlatform(location, platform = process.platform) {
     : absolute;
 }
 
-function isSubpathForPlatform(
-  parentPath,
-  childPath,
-  platform = process.platform,
-) {
+function isSubpathForPlatform(parentPath, childPath, platform = process.platform) {
   const pathModule = platform === 'win32' ? path.win32 : path;
   let parent = pathModule.resolve(parentPath);
   let child = pathModule.resolve(childPath);
@@ -271,10 +265,7 @@ export function evaluateTrustRules(
     const effectivePath =
       trustLevel === 'TRUST_PARENT' ? pathModule.dirname(rulePath) : rulePath;
     const realEffective = realPathIfPresent(effectivePath, fsApi);
-    const normalizedEffective = normalizePathForPlatform(
-      realEffective,
-      platform,
-    );
+    const normalizedEffective = normalizePathForPlatform(realEffective, platform);
 
     if (
       isSubpathForPlatform(normalizedEffective, normalizedWorkspace, platform) &&
@@ -362,7 +353,12 @@ export function resolveWorkspaceTrust({
 
 export function findSelectedEnvFile(
   workspaceDir,
-  { homeDir, isTrusted, ignoreLocalEnv, fsApi = fs },
+  {
+    homeDir,
+    isTrusted,
+    ignoreLocalEnv,
+    fsApi = fs,
+  },
 ) {
   let currentDir = path.resolve(workspaceDir);
   while (true) {
@@ -413,11 +409,7 @@ export function classifyEnvSource(filePath, homeDir) {
 
 function isEscaped(text, index) {
   let backslashes = 0;
-  for (
-    let cursor = index - 1;
-    cursor >= 0 && text[cursor] === '\\';
-    cursor -= 1
-  ) {
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) {
     backslashes += 1;
   }
   return backslashes % 2 === 1;
@@ -526,28 +518,21 @@ export function runPhaseBPreflight({
     },
   };
 
-  if (nativePolicy.systemSettings.present) {
-    addBlocker(blockers, 'native-system-settings-present');
-  }
-  if (nativePolicy.systemDefaults.present) {
-    addBlocker(blockers, 'native-system-defaults-present');
-  }
+  if (nativePolicy.systemSettings.present) addBlocker(blockers, 'native-system-settings-present');
+  if (nativePolicy.systemDefaults.present) addBlocker(blockers, 'native-system-defaults-present');
   if (inheritedSensitive.GEMINI_CLI_SYSTEM_SETTINGS_PATH) {
     addBlocker(blockers, 'system-settings-override-present');
   }
   if (inheritedSensitive.GEMINI_CLI_SYSTEM_DEFAULTS_PATH) {
     addBlocker(blockers, 'system-defaults-override-present');
   }
-  if (hasAnyPresence(inheritedProxy)) {
-    addBlocker(blockers, 'inherited-proxy-present');
-  }
+  if (hasAnyPresence(inheritedProxy)) addBlocker(blockers, 'inherited-proxy-present');
   if (environment.CLOUD_SHELL === 'true') {
     addBlocker(blockers, 'cloud-shell-context-unsupported');
   }
 
-  const baselineUnknown = blockers.some(
-    (blocker) =>
-      blocker.startsWith('native-system-') || blocker.startsWith('system-'),
+  const baselineUnknown = blockers.some((blocker) =>
+    blocker.startsWith('native-system-') || blocker.startsWith('system-'),
   );
 
   let workspaceTrust = {
@@ -566,27 +551,14 @@ export function runPhaseBPreflight({
   if (!baselineUnknown) {
     const userSettingsPath = path.join(homeDir, GEMINI_DIR, 'settings.json');
     const user = readJsonObject(userSettingsPath, fsApi);
-    if (user.status === 'invalid') {
-      addBlocker(blockers, 'user-settings-invalid');
-    }
+    if (user.status === 'invalid') addBlocker(blockers, 'user-settings-invalid');
 
-    const workspaceIsHome = sameLocation(
-      workspaceDir,
-      homeDir,
-      fsApi,
-      platform,
-    );
-    const workspaceSettingsPath = path.join(
-      workspaceDir,
-      GEMINI_DIR,
-      'settings.json',
-    );
+    const workspaceIsHome = sameLocation(workspaceDir, homeDir, fsApi, platform);
+    const workspaceSettingsPath = path.join(workspaceDir, GEMINI_DIR, 'settings.json');
     const workspace = workspaceIsHome
       ? { status: 'absent', value: {} }
       : readJsonObject(workspaceSettingsPath, fsApi);
-    if (workspace.status === 'invalid') {
-      addBlocker(blockers, 'workspace-settings-invalid');
-    }
+    if (workspace.status === 'invalid') addBlocker(blockers, 'workspace-settings-invalid');
 
     if (user.status !== 'invalid' && workspace.status !== 'invalid') {
       workspaceTrust = resolveWorkspaceTrust({
