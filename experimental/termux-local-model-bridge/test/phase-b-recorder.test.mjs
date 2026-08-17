@@ -227,3 +227,18 @@ test('recorder CLI rejects non-decimal numeric arguments', () => {
     assert.match(result.stderr, /must be a decimal integer/);
   }
 });
+
+test('recorder CLI rejects unsafe decimal integers', () => {
+  const cliPath = fileURLToPath(
+    new URL('../bin/phase-b-recorder.mjs', import.meta.url),
+  );
+  const result = spawnSync(
+    process.execPath,
+    [cliPath, '--body-limit-bytes', '9007199254740993'],
+    { encoding: 'utf8' },
+  );
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /must be a safe decimal integer/);
+});
