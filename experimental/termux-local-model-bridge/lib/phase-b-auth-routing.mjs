@@ -54,16 +54,17 @@ export const MASK_TO_EMPTY_ENV_KEYS = Object.freeze([
 
 // Pinned 0.55.1 yargs flags (packages/cli/src/config/config.ts) capable of
 // overriding approval/trust/auth-routing/policy behavior independently of
-// this contract's isolatedSettings and childEnvironment. A future launcher
-// must never forward argv starting with these, regardless of source. Note
-// --telemetry* is retained even though the pinned CLI does not currently
-// wire argv into resolveTelemetrySettings(): env/settings already disable
-// telemetry, so this is inert defense in depth, not the load-bearing control
-// -- --yolo/--approval-mode/--skip-trust/--acp are the load-bearing ones,
-// since each maps directly to a real, verified bypass in pinned source.
+// this contract's isolatedSettings and childEnvironment. The future Phase B
+// launcher uses a closed-world argv policy and MUST NOT forward arbitrary
+// caller argv at all; this list remains defense-in-depth documentation and a
+// fail-closed check if a future implementation ever grows an explicit
+// forwarding path. --allowed-tools is included because pinned config.ts
+// resolves argv.allowedTools ahead of settings.tools.allowed and the schema
+// defines allowed tools as bypassing the confirmation dialog.
 export const FORBIDDEN_FORWARD_ARG_PREFIXES = Object.freeze([
   '--acp',
   '--admin-policy',
+  '--allowed-tools',
   '--approval-mode',
   '--experimental-acp',
   '--policy',
@@ -154,12 +155,29 @@ function buildSafeEnvironment(recorderOrigin) {
 
 function buildSettings(candidate) {
   return {
+    general: {
+      // Pinned settings allow auto_edit, which auto-approves edit tools. The
+      // controlled probe always starts from normal confirmation semantics.
+      defaultApprovalMode: 'default',
+    },
     security: {
       auth: {
         selectedType: AUTH_TYPES[candidate],
         enforcedType: AUTH_TYPES[candidate],
         useExternal: candidate === AUTH_CANDIDATES.GATEWAY,
       },
+      // Pinned config.ts enforces disableYoloMode after argv/default approval
+      // mode resolution. disableAlwaysAllow removes the persistent approval
+      // path from confirmation dialogs. Keep both hard-disabled even though
+      // the future launcher also owns argv exclusively.
+      disableYoloMode: true,
+      disableAlwaysAllow: true,
+    },
+    tools: {
+      // Pinned config.ts resolves argv.allowedTools || settings.tools.allowed.
+      // An empty system-settings allowlist prevents inherited user/workspace
+      // settings from silently auto-approving selected tools.
+      allowed: [],
     },
     // The preflight already fails closed on a settings-driven ide.enabled
     // (see phase-b-preflight.mjs's ide-mode-enabled-in-settings blocker), so
@@ -218,19 +236,38 @@ export function buildAuthRoutingContract({
       maskToEmpty: [...MASK_TO_EMPTY_ENV_KEYS],
       set: buildSafeEnvironment(recorderOrigin),
       runtimeBindings: {
+        // Pinned paths.ts redirects Gemini's user-level persistent state when
+        // GEMINI_CLI_HOME is set. The launcher must bind this to a freshly
+        // created private runtime directory, never the user's real Gemini home.
+        GEMINI_CLI_HOME: 'isolated-gemini-home-required',
         GEMINI_CLI_SYSTEM_SETTINGS_PATH: 'isolated-settings-file-required',
       },
     },
+    runtimeIsolation: {
+      runtimeRoot: 'fresh-private-temporary-directory-required',
+      geminiHome: 'fresh-private-directory-under-runtime-root-required',
+      workingDirectory: 'fresh-private-empty-directory-under-runtime-root-required',
+      systemSettingsFile: 'fresh-regular-file-under-runtime-root-required',
+      rejectPreexistingRuntimePaths: true,
+      rejectSymlinkRuntimePaths: true,
+      cleanupRequired: true,
+      nativeSystemPolicyHandling: 'deferred-before-tools-slice',
+    },
     isolatedSettings: buildSettings(candidate),
     argvPolicy: {
+      mode: 'launcher-owned-only',
+      forwardCallerArgs: false,
       injected: [],
       forbiddenForwardPrefixes: [...FORBIDDEN_FORWARD_ARG_PREFIXES],
     },
     safetyNotes: [
       'Do not launch Gemini from this contract artifact.',
-      'The runtime settings path is intentionally unresolved in this review slice.',
+      'The runtime settings/home/cwd paths are intentionally unresolved in this review slice.',
+      'The later launcher must use a fresh isolated GEMINI_CLI_HOME and an empty isolated cwd.',
+      'Arbitrary caller argv must never be forwarded; only launcher-owned arguments are permitted.',
       'Masking is mandatory even with advanced.ignoreLocalEnv=true.',
       'Only the recorder origin may receive model API traffic during the later probe.',
+      'Native OS system-policy participation remains deferred until before the tools slice.',
     ],
   };
 }
