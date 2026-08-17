@@ -6,9 +6,17 @@ import {
   DEFAULT_HOST,
 } from '../lib/phase-b-recorder.mjs';
 
+function parseInteger(value, label) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`${label} must be an integer`);
+  }
+  return parsed;
+}
+
 function parsePositiveInt(value, label) {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) {
+  const parsed = parseInteger(value, label);
+  if (parsed <= 0) {
     throw new Error(`${label} must be a positive integer`);
   }
   return parsed;
@@ -25,8 +33,8 @@ function parseArgs(argv) {
     if (arg === '--port') {
       const value = argv[++i];
       if (value === undefined) throw new Error('--port requires a value');
-      const parsed = Number.parseInt(value, 10);
-      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+      const parsed = parseInteger(value, '--port');
+      if (parsed < 0 || parsed > 65535) {
         throw new Error('--port must be an integer between 0 and 65535');
       }
       options.port = parsed;

@@ -47,6 +47,16 @@ export function sanitizeJsonShape(value, depth = 0) {
   }
 }
 
+export function sanitizeContentType(value) {
+  if (typeof value !== 'string') return null;
+  const mediaType = value.split(';', 1)[0].trim().toLowerCase();
+  if (mediaType === '') return 'present';
+  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mediaType)) {
+    return 'present';
+  }
+  return mediaType;
+}
+
 export function sanitizeRequest({ method, url, headers, body }) {
   const contentType = headers['content-type'];
   const apiKeyHeader = headers['x-goog-api-key'];
@@ -58,7 +68,7 @@ export function sanitizeRequest({ method, url, headers, body }) {
     bodyShape = 'empty';
   } else if (
     typeof contentType === 'string' &&
-    contentType.includes('application/json')
+    contentType.toLowerCase().includes('application/json')
   ) {
     try {
       bodyShape = sanitizeJsonShape(JSON.parse(body.toString('utf8')));
@@ -74,7 +84,7 @@ export function sanitizeRequest({ method, url, headers, body }) {
     method,
     path: parsedUrl.pathname,
     query: alt === null ? {} : { alt: alt === 'sse' ? 'sse' : 'present' },
-    contentType: typeof contentType === 'string' ? contentType : null,
+    contentType: sanitizeContentType(contentType),
     bodyBytes: body.length,
     bodyShape,
     auth: {

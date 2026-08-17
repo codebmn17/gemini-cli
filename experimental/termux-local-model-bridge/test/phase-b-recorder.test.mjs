@@ -5,7 +5,9 @@ import {
   classifyApiKeyHeader,
   createRecorderServer,
   LOCAL_PLACEHOLDER_API_KEY,
+  sanitizeContentType,
   sanitizeJsonShape,
+  sanitizeRequest,
 } from '../lib/phase-b-recorder.mjs';
 
 test('classifyApiKeyHeader never returns header values', () => {
@@ -42,6 +44,66 @@ test('sanitizeJsonShape preserves structure without values', () => {
   );
 });
 
+test('sanitizeJsonShape enforces depth, array, and object-key truncation', () => {
+  const tooManyKeys = Object.fromEntries(
+    Array.from({ length: 65 }, (_, index) => [`key${index}`, index]),
+  );
+  const deep = { level: {} };
+  let cursor = deep.level;
+  for (let index = 0; index < 8; index += 1) {
+    cursor.next = {};
+    cursor = cursor.next;
+  }
+
+  const shape = sanitizeJsonShape({
+    array: [1, 2, 3, 4, 5],
+    object: tooManyKeys,
+    deep,
+  });
+
+  assert.deepEqual(shape.array, [
+    'number',
+    'number',
+    'number',
+    'number',
+    '<truncated>',
+  ]);
+  assert.equal(Object.keys(shape.object).length, 65);
+  assert.equal(shape.object['<truncated>'], true);
+  assert.equal(JSON.stringify(shape.deep).includes('<max-depth>'), true);
+});
+
+test('sanitizeContentType drops parameters and arbitrary malformed values', () => {
+  assert.equal(
+    sanitizeContentType('Application/JSON; charset=utf-8; secret=never-log-me'),
+    'application/json',
+  );
+  assert.equal(sanitizeContentType('not a media type; secret=value'), 'present');
+  assert.equal(sanitizeContentType(undefined), null);
+});
+
+test('sanitizeRequest drops arbitrary query values and handles invalid JSON', () => {
+  const record = sanitizeRequest({
+    method: 'POST',
+    url: '/v1beta/models/test:generateContent?alt=custom&token=never-log-query',
+    headers: { 'content-type': 'application/json; secret=never-log-header' },
+    body: Buffer.from('{not valid json'),
+  });
+
+  assert.deepEqual(record.query, { alt: 'present' });
+  assert.equal(record.contentType, 'application/json');
+  assert.equal(record.bodyShape, 'invalid-json');
+  assert.deepEqual(record.auth, {
+    authorizationPresent: false,
+    xGoogApiKey: 'absent',
+    privilegedUserIdPresent: false,
+  });
+
+  const serialized = JSON.stringify(record);
+  assert.equal(serialized.includes('never-log-query'), false);
+  assert.equal(serialized.includes('never-log-header'), false);
+});
+
 test('recorder binds to loopback and emits only sanitized request facts', async () => {
   const records = [];
   const recorder = createRecorderServer({
@@ -61,7 +123,7 @@ test('recorder binds to loopback and emits only sanitized request facts', async 
       {
         method: 'POST',
         headers: {
-          'content-type': 'application/json',
+          'content-type': 'application/json; charset=utf-8; secret=never-log-header',
           authorization: 'Bearer never-log-me',
           'x-goog-api-key': 'real-secret-value',
           'x-gemini-api-privileged-user-id': 'stable-install-id',
@@ -95,6 +157,7 @@ test('recorder binds to loopback and emits only sanitized request facts', async 
     assert.equal(serialized.includes('stable-install-id'), false);
     assert.equal(serialized.includes('private prompt'), false);
     assert.equal(serialized.includes('never-log-query'), false);
+    assert.equal(serialized.includes('never-log-header'), false);
   } finally {
     await recorder.close();
   }
@@ -107,7 +170,7 @@ test('recorder rejects non-loopback binding', () => {
   );
 });
 
-test('recorder enforces request body limit without recording payload', async () => {
+test('recorder accepts exact body limit and rejects the next byte', async () => {
   const records = [];
   const recorder = createRecorderServer({
     bodyLimitBytes: 8,
@@ -116,14 +179,28 @@ test('recorder enforces request body limit without recording payload', async () 
   const address = await recorder.listen();
 
   try {
-    const response = await fetch(`http://${address.host}:${address.port}/probe`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ too: 'large' }),
-    });
+    const exactResponse = await fetch(
+      `http://${address.host}:${address.port}/probe`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: Buffer.alloc(8, 0x61),
+      },
+    );
+    assert.equal(exactResponse.status, 503);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].bodyBytes, 8);
 
-    assert.equal(response.status, 413);
-    assert.equal(records.length, 0);
+    const oversizedResponse = await fetch(
+      `http://${address.host}:${address.port}/probe`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: Buffer.alloc(9, 0x62),
+      },
+    );
+    assert.equal(oversizedResponse.status, 413);
+    assert.equal(records.length, 1);
   } finally {
     await recorder.close();
   }
