@@ -14,6 +14,12 @@ import {
   materializePhaseBRuntime,
   verifyPhaseBRuntime,
 } from './phase-b-runtime.mjs';
+import {
+  CONTROL_ENV_KEYS,
+  PROXY_ENV_KEYS,
+  SENSITIVE_ENV_KEYS,
+  presenceMap,
+} from './phase-b-preflight.mjs';
 
 export const PHASE_B_LAUNCH_PROBE_SCHEMA_VERSION = 1;
 export const HARMLESS_PROBE_PROMPT =
@@ -71,6 +77,42 @@ function requireTimeoutMs(value) {
     );
   }
   return value;
+}
+
+// A preflight report only proves the environment it was generated from was
+// safe; it says nothing about the environment the launch actually runs in
+// unless the two are the same snapshot. Reusing phase-b-preflight.mjs's own
+// exported key lists and presenceMap() (not duplicating them, so this can't
+// silently drift from what the preflight itself checks) to require that every
+// sensitive/proxy/control variable's *presence* is unchanged between the two.
+// This is intentionally a presence check, not a value check: the preflight
+// report itself never carries the actual values (only booleans), so this
+// cannot compare or leak values either, and it stays a narrow, bounded
+// addition rather than a general environment-attestation system.
+function requireConsistentPreflightEnvironment(preflightReport, parentEnv) {
+  const inherited = preflightReport?.inherited;
+  if (!isPlainObject(inherited)) {
+    fail('preflight report is missing the inherited-environment snapshot');
+  }
+  const groups = [
+    ['sensitive', SENSITIVE_ENV_KEYS],
+    ['proxy', PROXY_ENV_KEYS],
+    ['control', CONTROL_ENV_KEYS],
+  ];
+  for (const [group, keys] of groups) {
+    const expected = inherited[group];
+    if (!isPlainObject(expected)) {
+      fail(`preflight report inherited.${group} is missing or invalid`);
+    }
+    const current = presenceMap(parentEnv, keys);
+    for (const key of keys) {
+      if (expected[key] !== current[key]) {
+        fail(
+          'current environment no longer matches the environment the preflight report was generated from',
+        );
+      }
+    }
+  }
 }
 
 function readRegularFileNoFollow(filePath, maxBytes, label) {
@@ -191,7 +233,7 @@ export function reverifyPinnedEntrypoint(distribution) {
   }
 }
 
-function buildLaunchContract(preflightReport, recorderOrigin) {
+export function buildLaunchContract(preflightReport, recorderOrigin) {
   const contract = structuredClone(
     buildAuthRoutingContract({
       candidate: AUTH_CANDIDATES.USE_GEMINI,
@@ -203,6 +245,28 @@ function buildLaunchContract(preflightReport, recorderOrigin) {
   // Pinned v0.55.1 gates extension/update network checks on this setting.
   // This launch-only clone deliberately does not alter accepted PR #4/#5.
   contract.isolatedSettings.general.enableAutoUpdate = false;
+
+  // Pinned userStartupWarnings.ts's folderTrustCheck throws a fatal
+  // FatalUntrustedWorkspaceError for any headless (--prompt) invocation in an
+  // untrusted folder -- which this isolated, freshly created cwd always is,
+  // by design, since nothing ever writes a trustedFolders rule for it. Pinned
+  // isFolderTrustEnabled() short-circuits that check (and checkPathTrust's
+  // "folder-trust-disabled" branch, used everywhere else trust is consulted)
+  // to isTrusted=true the moment security.folderTrust.enabled is false, with
+  // no dependency on GEMINI_CLI_TRUST_WORKSPACE or --skip-trust -- both of
+  // which remain untouched here and stay on the forbidden/masked lists.
+  // This is deliberately narrower than either broad bypass: it only ever
+  // flips the *trust conclusion* for this one throwaway directory, not an
+  // env var or argv flag a future launcher path could accidentally forward
+  // elsewhere. Safe specifically because the cwd this trust conclusion
+  // applies to is always empty (verified immediately before spawn) and the
+  // isolated GEMINI_CLI_HOME has no pre-existing state either, so there is no
+  // real user/workspace settings content for the now-open workspace-merge
+  // gate to actually admit; and because every trust-gated behavior this
+  // contract cares about (approval mode, tools.allowed, IDE mode, workspace
+  // policy loading) is already independently pinned above and does not rely
+  // on the untrusted-folder fallback to reach its safe value.
+  contract.isolatedSettings.security.folderTrust = { enabled: false };
   return contract;
 }
 
@@ -316,6 +380,7 @@ export async function runPhaseBLaunchProbe(options) {
     timeoutMs = DEFAULT_LAUNCH_TIMEOUT_MS,
   } = normalized;
   requireTimeoutMs(timeoutMs);
+  requireConsistentPreflightEnvironment(preflightReport, parentEnv);
 
   const distribution = resolvePinnedGeminiDistribution(geminiRoot);
 

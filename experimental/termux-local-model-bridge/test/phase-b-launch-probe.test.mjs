@@ -6,22 +6,47 @@ import test from 'node:test';
 import { execFileSync } from 'node:child_process';
 import {
   HARMLESS_PROBE_PROMPT,
+  buildLaunchContract,
   resolvePinnedGeminiDistribution,
   reverifyPinnedEntrypoint,
   runPhaseBLaunchProbe,
 } from '../lib/phase-b-launch-probe.mjs';
 import {
+  materializePhaseBRuntime,
+  cleanupPhaseBRuntime,
+  verifyPhaseBRuntime,
+} from '../lib/phase-b-runtime.mjs';
+import {
   PINNED_GEMINI_CLI_COMMIT,
   PINNED_GEMINI_CLI_VERSION,
 } from '../lib/phase-b-auth-routing.mjs';
 import { LOCAL_PLACEHOLDER_API_KEY } from '../lib/phase-b-recorder.mjs';
+import {
+  CONTROL_ENV_KEYS,
+  PROXY_ENV_KEYS,
+  SENSITIVE_ENV_KEYS,
+  presenceMap,
+} from '../lib/phase-b-preflight.mjs';
 
-const GOOD_PREFLIGHT = Object.freeze({
-  schemaVersion: 1,
-  pinnedGeminiCliVersion: PINNED_GEMINI_CLI_VERSION,
-  allowed: true,
-  blockers: [],
-});
+// Builds a preflight report whose inherited-environment snapshot genuinely
+// matches parentEnv, so requireConsistentPreflightEnvironment() accepts it --
+// mirroring how a real caller must run preflight and launch against the same
+// environment snapshot, not just reuse a fixed report.
+function buildPreflightReport(parentEnv = process.env) {
+  return Object.freeze({
+    schemaVersion: 1,
+    pinnedGeminiCliVersion: PINNED_GEMINI_CLI_VERSION,
+    allowed: true,
+    blockers: [],
+    inherited: {
+      sensitive: presenceMap(parentEnv, SENSITIVE_ENV_KEYS),
+      proxy: presenceMap(parentEnv, PROXY_ENV_KEYS),
+      control: presenceMap(parentEnv, CONTROL_ENV_KEYS),
+    },
+  });
+}
+
+const GOOD_PREFLIGHT = buildPreflightReport();
 
 function makeTempParent() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'phase-b-launch-test-'));
@@ -86,15 +111,16 @@ test('synthetic pinned distribution reaches only the local recorder with fixed l
   const tempParent = makeTempParent();
   try {
     const geminiRoot = makeDistribution(tempParent, goodFakeBundle());
+    const parentEnv = {
+      GEMINI_EXP: '/tmp/attacker-experiments.json',
+      GEMINI_CLI_NO_RELAUNCH: 'false',
+      HOME: '/tmp/attacker-home',
+      NODE_OPTIONS: '--require /tmp/evil.js',
+    };
     const report = await runPhaseBLaunchProbe({
       geminiRoot,
-      preflightReport: GOOD_PREFLIGHT,
-      parentEnv: {
-        GEMINI_EXP: '/tmp/attacker-experiments.json',
-        GEMINI_CLI_NO_RELAUNCH: 'false',
-        HOME: '/tmp/attacker-home',
-        NODE_OPTIONS: '--require /tmp/evil.js',
-      },
+      preflightReport: buildPreflightReport(parentEnv),
+      parentEnv,
       tempParent,
       timeoutMs: 3000,
     });
@@ -327,5 +353,119 @@ test('launch source introduces process spawn but no network client capability', 
     'WebSocket',
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
+  }
+});
+
+// Pinned userStartupWarnings.ts's folderTrustCheck throws a fatal
+// FatalUntrustedWorkspaceError for any headless invocation in an untrusted
+// folder, which this isolated cwd always is. security.folderTrust.enabled is
+// the narrow, source-verified fix (isFolderTrustEnabled() short-circuits the
+// check), added alongside -- not instead of -- every other already-reviewed
+// trust/tool/auth control. This proves the new field landed without
+// loosening any of the others.
+test('launch contract pins folder trust disabled alongside every other already-reviewed control', () => {
+  const contract = buildLaunchContract(GOOD_PREFLIGHT, 'http://127.0.0.1:43123');
+
+  assert.equal(contract.isolatedSettings.security.folderTrust.enabled, false);
+  assert.equal(contract.isolatedSettings.general.enableAutoUpdate, false);
+  assert.equal(contract.isolatedSettings.general.defaultApprovalMode, 'default');
+  assert.equal(contract.isolatedSettings.security.disableYoloMode, true);
+  assert.equal(contract.isolatedSettings.security.disableAlwaysAllow, true);
+  assert.deepEqual(contract.isolatedSettings.tools.allowed, []);
+  assert.equal(contract.isolatedSettings.ide.enabled, false);
+  assert.equal(contract.isolatedSettings.advanced.ignoreLocalEnv, true);
+
+  // The two broad bypasses this narrower fix deliberately avoids stay exactly
+  // as PR #4 left them: GEMINI_CLI_TRUST_WORKSPACE still unconditionally
+  // masked to empty, and --skip-trust still on the forbidden-forward list.
+  assert.ok(
+    contract.childEnvironment.maskToEmpty.includes('GEMINI_CLI_TRUST_WORKSPACE'),
+  );
+  assert.notEqual(
+    contract.childEnvironment.set.GEMINI_CLI_TRUST_WORKSPACE,
+    'true',
+  );
+  assert.equal(contract.argvPolicy.forwardCallerArgs, false);
+  assert.ok(contract.argvPolicy.forbiddenForwardPrefixes.includes('--skip-trust'));
+});
+
+test('runPhaseBLaunchProbe rejects a materially different launch environment than the preflight snapshot', async () => {
+  const staleReport = buildPreflightReport({});
+  await assert.rejects(
+    runPhaseBLaunchProbe({
+      geminiRoot: '/nonexistent-on-purpose',
+      preflightReport: staleReport,
+      parentEnv: { HTTPS_PROXY: 'http://attacker-proxy.example:8080' },
+    }),
+    /current environment no longer matches/,
+  );
+});
+
+test('runPhaseBLaunchProbe rejects a preflight report missing the inherited-environment snapshot', async () => {
+  const legacyShapedReport = Object.freeze({
+    schemaVersion: 1,
+    pinnedGeminiCliVersion: PINNED_GEMINI_CLI_VERSION,
+    allowed: true,
+    blockers: [],
+  });
+  await assert.rejects(
+    runPhaseBLaunchProbe({
+      geminiRoot: '/nonexistent-on-purpose',
+      preflightReport: legacyShapedReport,
+      parentEnv: {},
+    }),
+    /missing the inherited-environment snapshot/,
+  );
+});
+
+// The launch probe's own environment-consistency check must not itself
+// become a way to leak values: it may only ever compare presence booleans.
+test('preflight/launch environment consistency check compares presence only, never leaks values', () => {
+  const source = fs.readFileSync(
+    new URL('../lib/phase-b-launch-probe.mjs', import.meta.url),
+    'utf8',
+  );
+  const fn = source.slice(
+    source.indexOf('function requireConsistentPreflightEnvironment'),
+    source.indexOf('\n}\n', source.indexOf('function requireConsistentPreflightEnvironment')),
+  );
+  assert.ok(fn.includes('presenceMap'));
+  assert.equal(/console\.(log|error)/.test(fn), false);
+});
+
+// verifyPhaseBRuntime (PR #5, unmodified here) is the runtime's own last
+// pre-spawn checkpoint, including cwd emptiness. This proves runPhaseBLaunchProbe
+// still wires it in immediately before constructing launcherArgs/spawning, and
+// that the underlying protection it depends on -- cwd-tampering detection --
+// still fails closed the same way PR #5's own suite already establishes.
+test('runtime integrity verification (including empty-cwd enforcement) remains wired in before spawn', async () => {
+  const source = await fs.promises.readFile(
+    new URL('../lib/phase-b-launch-probe.mjs', import.meta.url),
+    'utf8',
+  );
+  const verifyCallIndex = source.indexOf('verifyPhaseBRuntime(runtime)');
+  const launcherArgsIndex = source.indexOf('const launcherArgs');
+  const spawnCallIndex = source.indexOf('child = spawn(');
+  assert.ok(verifyCallIndex > 0, 'verifyPhaseBRuntime must still be called');
+  assert.ok(
+    verifyCallIndex < launcherArgsIndex && launcherArgsIndex < spawnCallIndex,
+    'verification must happen before argv construction and before spawn',
+  );
+
+  // Confirm the mechanism it depends on is still intact: a cwd contaminated
+  // after materialization must still be caught before anything would spawn.
+  const tempParent = fs.mkdtempSync(path.join(os.tmpdir(), 'phase-b-launch-cwd-check-'));
+  let runtime;
+  try {
+    runtime = materializePhaseBRuntime({
+      contract: buildLaunchContract(GOOD_PREFLIGHT, 'http://127.0.0.1:43123'),
+      parentEnv: {},
+      tempParent,
+    });
+    fs.writeFileSync(path.join(runtime.workingDirectory, 'unexpected.txt'), 'x');
+    assert.throws(() => verifyPhaseBRuntime(runtime));
+  } finally {
+    if (runtime) cleanupPhaseBRuntime(runtime);
+    fs.rmSync(tempParent, { recursive: true, force: true });
   }
 });
