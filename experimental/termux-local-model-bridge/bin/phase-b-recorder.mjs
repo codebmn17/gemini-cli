@@ -7,11 +7,10 @@ import {
 } from '../lib/phase-b-recorder.mjs';
 
 function parseInteger(value, label) {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed)) {
-    throw new Error(`${label} must be an integer`);
+  if (!/^(0|[1-9]\d*)$/.test(value)) {
+    throw new Error(`${label} must be a decimal integer`);
   }
-  return parsed;
+  return Number(value);
 }
 
 function parsePositiveInt(value, label) {

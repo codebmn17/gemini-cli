@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   classifyApiKeyHeader,
@@ -203,5 +205,25 @@ test('recorder accepts exact body limit and rejects the next byte', async () => 
     assert.equal(records.length, 1);
   } finally {
     await recorder.close();
+  }
+});
+
+test('recorder CLI rejects non-decimal numeric arguments', () => {
+  const cliPath = fileURLToPath(
+    new URL('../bin/phase-b-recorder.mjs', import.meta.url),
+  );
+  for (const args of [
+    ['--port', '123abc'],
+    ['--port', ''],
+    ['--port', '0x10'],
+    ['--body-limit-bytes', '8junk'],
+    ['--body-limit-bytes', '1e3'],
+  ]) {
+    const result = spawnSync(process.execPath, [cliPath, ...args], {
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.match(result.stderr, /must be a decimal integer/);
   }
 });
