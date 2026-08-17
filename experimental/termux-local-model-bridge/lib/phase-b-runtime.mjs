@@ -88,6 +88,43 @@ function stringRecordsEqual(actual, expected) {
   );
 }
 
+// Runtime-owned hardening independent of the auth-routing contract's own
+// maskToEmpty list, which governs Gemini/API/proxy-specific keys. These are
+// generic Node-runtime and OS-loader variables that are interpreted *before*
+// any Gemini application code runs -- by Node's own bootstrap (NODE_OPTIONS
+// can `--require` arbitrary code; NODE_PATH alters module resolution) or by
+// the platform dynamic linker (LD_PRELOAD/LD_LIBRARY_PATH on Linux/Android,
+// DYLD_* on Darwin) -- plus HOME/XDG_* base-dir variables that many
+// dependencies consult via raw os.homedir()/XDG lookups independently of
+// Gemini's own GEMINI_CLI_HOME-first paths.ts wrapper, and NODE_EXTRA_CA_CERTS
+// / SSL_CERT_FILE / SSL_CERT_DIR which can redirect TLS trust. None of these
+// are safe to forward into a materialized child environment regardless of
+// what any contract declares, so they are masked here unconditionally as a
+// second, contract-independent layer of defense.
+export const GENERIC_RUNTIME_MASK_KEYS = Object.freeze([
+  'HOME',
+  'NODE_EXTRA_CA_CERTS',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'SSL_CERT_DIR',
+  'SSL_CERT_FILE',
+  'XDG_CACHE_HOME',
+  'XDG_CONFIG_HOME',
+  'XDG_DATA_HOME',
+  'XDG_RUNTIME_DIR',
+  'XDG_STATE_HOME',
+]);
+
+// Prefix families rather than exact names: every LD_* variable (LD_PRELOAD,
+// LD_LIBRARY_PATH, LD_AUDIT, ...) and every DYLD_* variable are dynamic-linker
+// inputs on Linux/Android and Darwin respectively, and Gemini/Node need none
+// of them, so the whole family is masked whenever present in the parent.
+export const GENERIC_RUNTIME_MASK_PREFIXES = Object.freeze(['LD_', 'DYLD_']);
+
+function isGenericRuntimeMaskKey(key) {
+  return GENERIC_RUNTIME_MASK_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
 function expectedSafeEnvironment(recorderOrigin) {
   return {
     GEMINI_API_KEY: LOCAL_PLACEHOLDER_API_KEY,
@@ -265,14 +302,30 @@ function requirePrivateMode(stat, label) {
   }
 }
 
+// Opens the directory itself (O_NOFOLLOW so a trailing symlink fails the
+// open outright, O_DIRECTORY so a non-directory does too) and verifies/chmods
+// via that held descriptor rather than re-touching the path afterward. A
+// path-based chmodSync()-then-lstatSync() pair (the prior implementation)
+// leaves a window between the two calls where the path could be swapped out
+// from under it; fchmodSync/fstatSync on an already-open descriptor cannot be
+// redirected by anything that happens to the path afterward. Mirrors the
+// descriptor-held pattern writePrivateSettings already uses below.
 function verifyPrivateDirectory(directoryPath) {
-  fs.chmodSync(directoryPath, 0o700);
-  const stat = fs.lstatSync(directoryPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    fail('runtime directory is not a real directory');
+  const dirFlag = fs.constants.O_DIRECTORY ?? 0;
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const descriptor = fs.openSync(
+    directoryPath,
+    fs.constants.O_RDONLY | dirFlag | noFollow,
+  );
+  try {
+    fs.fchmodSync(descriptor, 0o700);
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isDirectory()) fail('runtime directory is not a real directory');
+    requirePrivateMode(stat, 'runtime directory');
+    return stat;
+  } finally {
+    fs.closeSync(descriptor);
   }
-  requirePrivateMode(stat, 'runtime directory');
-  return stat;
 }
 
 function createPrivateDirectory(directoryPath) {
@@ -332,6 +385,10 @@ function buildChildEnvironment(contract, parentEnv, runtimeBindings) {
     if (typeof value === 'string') child[key] = value;
   }
   for (const key of contract.childEnvironment.maskToEmpty) child[key] = '';
+  for (const key of GENERIC_RUNTIME_MASK_KEYS) child[key] = '';
+  for (const key of Object.keys(child)) {
+    if (isGenericRuntimeMaskKey(key)) child[key] = '';
+  }
   Object.assign(child, contract.childEnvironment.set);
   Object.assign(child, runtimeBindings);
   return child;
@@ -491,7 +548,19 @@ export function cleanupPhaseBRuntime(runtime) {
   try {
     fs.closeSync(metadata.settingsDescriptor);
   } finally {
-    removeRuntimeRoot(metadata.runtimeRoot);
-    ACTIVE_RUNTIMES.delete(runtime);
+    // Nested so the handle is deregistered even if directory removal throws
+    // (e.g. an unremovable entry). Without this, a failed removeRuntimeRoot
+    // left the handle "active": a retry would re-run requireActiveRuntime
+    // successfully and call fs.closeSync again on a descriptor number that
+    // was already closed above -- either a confusing EBADF, or worse, a
+    // silent close of an unrelated descriptor if the OS had since reused
+    // that fd number for something else in this process. Marking the handle
+    // inactive here means a retry instead gets a clean, honest "unknown or
+    // already cleaned" from requireActiveRuntime.
+    try {
+      removeRuntimeRoot(metadata.runtimeRoot);
+    } finally {
+      ACTIVE_RUNTIMES.delete(runtime);
+    }
   }
 }

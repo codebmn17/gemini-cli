@@ -3,11 +3,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { execFileSync } from 'node:child_process';
 import {
   AUTH_CANDIDATES,
   buildAuthRoutingContract,
 } from '../lib/phase-b-auth-routing.mjs';
 import {
+  GENERIC_RUNTIME_MASK_KEYS,
+  GENERIC_RUNTIME_MASK_PREFIXES,
   cleanupPhaseBRuntime,
   materializePhaseBRuntime,
   validateAuthRoutingContractForRuntime,
@@ -286,4 +289,164 @@ test('runtime source contains filesystem materialization but no process or netwo
     assert.equal(source.includes(forbidden), false, forbidden);
   }
   assert.equal(source.includes("from 'node:fs'"), true);
+});
+
+// Node/OS-runtime variables interpreted before any Gemini application code
+// runs: NODE_OPTIONS can `--require` arbitrary code into the process,
+// LD_PRELOAD/DYLD_INSERT_LIBRARIES force a shared library into it, and
+// HOME/XDG_*/NODE_EXTRA_CA_CERTS/SSL_CERT_* redirect config, cache, or TLS
+// trust. None of these are in the auth-routing contract's maskToEmpty list
+// (which only covers Gemini/API/proxy-specific keys), so the runtime module
+// must mask them itself as a second, contract-independent layer -- this is
+// what a real materialized childEnvironment would hand to a future spawn.
+test('masks generic Node/OS runtime-injection variables independently of the contract mask list', () => {
+  const tempParent = makeTempParent();
+  let runtime;
+  try {
+    const maliciousParentEnv = {
+      NODE_OPTIONS: '--require /tmp/evil-preload.js',
+      NODE_PATH: '/tmp/attacker-node-modules',
+      LD_PRELOAD: '/tmp/evil.so',
+      LD_LIBRARY_PATH: '/tmp/attacker-libs',
+      LD_AUDIT: '/tmp/attacker-audit.so',
+      DYLD_INSERT_LIBRARIES: '/tmp/evil.dylib',
+      DYLD_LIBRARY_PATH: '/tmp/attacker-libs-mac',
+      DYLD_FALLBACK_LIBRARY_PATH: '/tmp/attacker-fallback-libs',
+      HOME: '/tmp/attacker-controlled-home',
+      XDG_CONFIG_HOME: '/tmp/attacker-xdg-config',
+      XDG_DATA_HOME: '/tmp/attacker-xdg-data',
+      XDG_CACHE_HOME: '/tmp/attacker-xdg-cache',
+      XDG_STATE_HOME: '/tmp/attacker-xdg-state',
+      XDG_RUNTIME_DIR: '/tmp/attacker-xdg-runtime',
+      NODE_EXTRA_CA_CERTS: '/tmp/attacker-ca.pem',
+      SSL_CERT_FILE: '/tmp/attacker-ssl-cert-file.pem',
+      SSL_CERT_DIR: '/tmp/attacker-ssl-cert-dir',
+      KEEP_ME: 'kept',
+    };
+
+    runtime = materializePhaseBRuntime({
+      contract: buildContract(),
+      parentEnv: maliciousParentEnv,
+      tempParent,
+    });
+
+    for (const key of Object.keys(maliciousParentEnv)) {
+      if (key === 'KEEP_ME') continue;
+      assert.equal(runtime.childEnvironment[key], '', key);
+    }
+    assert.equal(runtime.childEnvironment.KEEP_ME, 'kept');
+  } finally {
+    if (runtime) cleanupPhaseBRuntime(runtime);
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+test('generic runtime mask keys and prefixes are exported and cover the named injection surfaces', () => {
+  for (const key of [
+    'HOME',
+    'NODE_OPTIONS',
+    'NODE_PATH',
+    'NODE_EXTRA_CA_CERTS',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+    'XDG_CONFIG_HOME',
+    'XDG_DATA_HOME',
+    'XDG_CACHE_HOME',
+    'XDG_STATE_HOME',
+  ]) {
+    assert.ok(GENERIC_RUNTIME_MASK_KEYS.includes(key), key);
+  }
+  assert.ok(GENERIC_RUNTIME_MASK_PREFIXES.includes('LD_'));
+  assert.ok(GENERIC_RUNTIME_MASK_PREFIXES.includes('DYLD_'));
+});
+
+// Directory creation now opens the new directory (O_NOFOLLOW|O_DIRECTORY) and
+// chmods/stats that descriptor rather than the path, closing the window
+// between mkdtempSync/mkdirSync and a path-based chmodSync+lstatSync where
+// the path could be swapped. This test covers the complementary, always-
+// testable half: that a runtime root swapped for a symlink *after*
+// materialization is still caught, extending symlink-attack coverage to the
+// runtime root itself (previously only cwd-contamination and settings-file
+// replacement were covered here).
+test('integrity recheck rejects a runtime root swapped for a symlink after materialization', () => {
+  const tempParent = makeTempParent();
+  let runtime;
+  try {
+    runtime = materializePhaseBRuntime({
+      contract: buildContract(),
+      parentEnv: {},
+      tempParent,
+    });
+    assert.equal(verifyPhaseBRuntime(runtime), true);
+
+    const decoy = path.join(tempParent, 'decoy-target');
+    fs.mkdirSync(decoy, { mode: 0o700 });
+    fs.rmSync(runtime.runtimeRoot, { recursive: true, force: true });
+    fs.symlinkSync(decoy, runtime.runtimeRoot);
+
+    assert.throws(() => verifyPhaseBRuntime(runtime));
+
+    fs.unlinkSync(runtime.runtimeRoot);
+    fs.rmSync(decoy, { recursive: true, force: true });
+    runtime = null;
+  } finally {
+    if (runtime) cleanupPhaseBRuntime(runtime);
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+// Reproduces a failed directory removal (via chattr +i, which this sandbox
+// enforces even for root) to prove cleanup no longer leaves the handle
+// "active" after fs.closeSync has already succeeded. Before the fix, a retry
+// found the stale handle still registered and called fs.closeSync again on
+// an already-closed descriptor number -- confusing at best (EBADF) and
+// unsafe at worst (silently closing an unrelated fd if the number had been
+// reused elsewhere in the process). Skips cleanly where chattr/immutable
+// attributes aren't available so this stays portable across CI filesystems.
+test('a failed cleanup still deregisters the handle so a retry fails cleanly instead of double-closing', (t) => {
+  if (process.platform !== 'linux') {
+    t.skip('chattr immutable-attribute test is Linux-specific');
+    return;
+  }
+  const tempParent = makeTempParent();
+  let runtime;
+  let madeImmutable = false;
+  try {
+    runtime = materializePhaseBRuntime({
+      contract: buildContract(),
+      parentEnv: {},
+      tempParent,
+    });
+    try {
+      execFileSync('chattr', ['+i', runtime.systemSettingsFile], {
+        stdio: 'pipe',
+      });
+      madeImmutable = true;
+    } catch {
+      t.skip('chattr +i unsupported on this filesystem');
+      return;
+    }
+
+    assert.throws(() => cleanupPhaseBRuntime(runtime));
+    let secondError;
+    try {
+      cleanupPhaseBRuntime(runtime);
+    } catch (e) {
+      secondError = e;
+    }
+    assert.ok(secondError, 'retry must still throw');
+    assert.equal(secondError.code, 'PHASE_B_RUNTIME_BLOCKED');
+    assert.match(secondError.message, /unknown or already cleaned/);
+  } finally {
+    if (madeImmutable) {
+      try {
+        execFileSync('chattr', ['-i', runtime.systemSettingsFile], {
+          stdio: 'pipe',
+        });
+      } catch {
+        // best effort so the finally below can still remove the tree
+      }
+    }
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
 });
