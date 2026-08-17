@@ -297,20 +297,16 @@ export function evaluateTrustRules(
   return undefined;
 }
 
-export function resolveWorkspaceTrust({
-  workspaceDir,
-  homeDir,
-  environment = process.env,
-  userSettings = {},
-  fsApi = fs,
-  platform = process.platform,
-}) {
+function evaluateFolderTrust(
+  folderTrustSettings,
+  { workspaceDir, homeDir, environment, fsApi, platform },
+) {
   if (environment.GEMINI_CLI_TRUST_WORKSPACE === 'true') {
     return { status: 'ok', isTrusted: true, source: 'env' };
   }
 
   const folderTrust = readBooleanSetting(
-    userSettings,
+    folderTrustSettings,
     ['security', 'folderTrust', 'enabled'],
     true,
   );
@@ -339,7 +335,7 @@ export function resolveWorkspaceTrust({
     };
   }
 
-  const ideMode = readBooleanSetting(userSettings, ['ide', 'enabled'], false);
+  const ideMode = readBooleanSetting(folderTrustSettings, ['ide', 'enabled'], false);
   if (ideMode.status === 'invalid') {
     return {
       status: 'blocked',
@@ -379,6 +375,88 @@ export function resolveWorkspaceTrust({
     isTrusted: trust ?? false,
     source: trust === undefined ? 'none' : 'file',
   };
+}
+
+/**
+ * Gemini 0.55.1 only ever reads security.folderTrust.enabled and ide.enabled
+ * while resolving trust, so those are the only two fields that need a
+ * workspace-over-user merge here (matching mergeSettings()'s "defined key from
+ * the later source wins" semantics for a single scalar field).
+ */
+function mergeFolderTrustSettings(userSettings, workspaceSettings) {
+  const workspaceFolderTrust = getNested(
+    workspaceSettings,
+    ['security', 'folderTrust', 'enabled'],
+  );
+  const workspaceIdeEnabled = getNested(workspaceSettings, ['ide', 'enabled']);
+  return {
+    security: {
+      folderTrust: {
+        enabled:
+          workspaceFolderTrust !== undefined
+            ? workspaceFolderTrust
+            : getNested(userSettings, ['security', 'folderTrust', 'enabled']),
+      },
+    },
+    ide: {
+      enabled:
+        workspaceIdeEnabled !== undefined
+          ? workspaceIdeEnabled
+          : getNested(userSettings, ['ide', 'enabled']),
+    },
+  };
+}
+
+/**
+ * Reproduces Gemini 0.55.1's two-stage trust bootstrap in
+ * packages/cli/src/config/settings.ts:
+ *
+ * 1. `_doLoadSettings()` computes an initial ("bootstrap") trust result from
+ *    settings layers that exclude workspace settings (schema defaults, system
+ *    defaults, user, system), and uses only that boolean to decide whether
+ *    workspace settings are allowed into `mergeSettings()` at all.
+ * 2. `loadEnvironment()` then calls `isWorkspaceTrusted()` a second time using
+ *    the fully merged settings (which now may include workspace's own
+ *    `security.folderTrust.enabled`/`ide.enabled` if bootstrap trust was
+ *    true), and *that* second result is what `findEnvFile()` actually uses.
+ *
+ * These two results can differ: a user can globally disable folder trust
+ * while a workspace re-enables it with no matching trustedFolders rule, in
+ * which case bootstrap trust is true (workspace settings participate) but the
+ * re-derived trust used for `.env` selection is false. Native/system-settings
+ * layers are already fail-closed earlier in this preflight, so stage 1 here
+ * only needs schema defaults (baked into evaluateFolderTrust's fallbacks) plus
+ * user settings.
+ */
+export function resolveWorkspaceTrust({
+  workspaceDir,
+  homeDir,
+  environment = process.env,
+  userSettings = {},
+  workspaceSettings = {},
+  fsApi = fs,
+  platform = process.platform,
+}) {
+  const bootstrap = evaluateFolderTrust(userSettings, {
+    workspaceDir,
+    homeDir,
+    environment,
+    fsApi,
+    platform,
+  });
+
+  if (bootstrap.status !== 'ok' || !bootstrap.isTrusted) {
+    // Workspace settings never enter Gemini's merge unless bootstrap trust is
+    // true, so there is no second stage to run here: the bootstrap result is
+    // also the final trust value used for .env selection.
+    return { ...bootstrap, workspaceSettingsParticipate: false };
+  }
+
+  const finalTrust = evaluateFolderTrust(
+    mergeFolderTrustSettings(userSettings, workspaceSettings),
+    { workspaceDir, homeDir, environment, fsApi, platform },
+  );
+  return { ...finalTrust, workspaceSettingsParticipate: true };
 }
 
 export function findSelectedEnvFile(
@@ -576,6 +654,7 @@ export function runPhaseBPreflight({
     status: 'blocked',
     isTrusted: false,
     source: 'undetermined',
+    workspaceSettingsParticipate: false,
   };
   let ignoreLocalEnv = { status: 'undetermined', value: null };
   let selectedEnv = {
@@ -603,6 +682,7 @@ export function runPhaseBPreflight({
         homeDir,
         environment,
         userSettings: user.value,
+        workspaceSettings: workspace.value,
         fsApi,
         platform,
       });
@@ -611,6 +691,11 @@ export function runPhaseBPreflight({
       }
 
       if (workspaceTrust.status === 'ok') {
+        // Workspace's own advanced.ignoreLocalEnv participates in the merge
+        // based on bootstrap (stage 1) trust, not the re-derived (stage 2)
+        // trust used for .gemini/.env selection below -- this mirrors
+        // loadEnvironment() reading ignoreLocalEnv off the already-merged
+        // tempMergedSettings rather than re-deriving it.
         const userIgnore = readBooleanSetting(
           user.value,
           ['advanced', 'ignoreLocalEnv'],
@@ -624,15 +709,19 @@ export function runPhaseBPreflight({
         if (userIgnore.status === 'invalid') {
           addBlocker(blockers, 'user-ignore-local-env-invalid');
         }
-        if (workspaceTrust.isTrusted && workspaceIgnore.status === 'invalid') {
+        if (
+          workspaceTrust.workspaceSettingsParticipate &&
+          workspaceIgnore.status === 'invalid'
+        ) {
           addBlocker(blockers, 'workspace-ignore-local-env-invalid');
         }
 
         if (
           userIgnore.status !== 'invalid' &&
-          (!workspaceTrust.isTrusted || workspaceIgnore.status !== 'invalid')
+          (!workspaceTrust.workspaceSettingsParticipate ||
+            workspaceIgnore.status !== 'invalid')
         ) {
-          const effectiveIgnore = workspaceTrust.isTrusted
+          const effectiveIgnore = workspaceTrust.workspaceSettingsParticipate
             ? workspaceIgnore.value
             : userIgnore.value;
           ignoreLocalEnv = { status: 'ok', value: effectiveIgnore };
@@ -673,6 +762,7 @@ export function runPhaseBPreflight({
       status: workspaceTrust.status,
       isTrusted: workspaceTrust.isTrusted,
       source: workspaceTrust.source,
+      workspaceSettingsParticipate: workspaceTrust.workspaceSettingsParticipate ?? false,
     },
     ignoreLocalEnv,
     selectedEnv,
