@@ -25,6 +25,7 @@ export const MASK_TO_EMPTY_ENV_KEYS = Object.freeze([
   'CLOUD_SHELL_VERSION',
   'GEMINI_CLI_CUSTOM_HEADERS',
   'GEMINI_CLI_SYSTEM_DEFAULTS_PATH',
+  'GEMINI_CLI_TRUST_WORKSPACE',
   'GEMINI_CLI_USE_COMPUTE_ADC',
   'GEMINI_DEFAULT_AUTH_TYPE',
   'GOOGLE_API_KEY',
@@ -51,13 +52,30 @@ export const MASK_TO_EMPTY_ENV_KEYS = Object.freeze([
   'no_proxy',
 ]);
 
+// Pinned 0.55.1 yargs flags (packages/cli/src/config/config.ts) capable of
+// overriding approval/trust/auth-routing/policy behavior independently of
+// this contract's isolatedSettings and childEnvironment. A future launcher
+// must never forward argv starting with these, regardless of source. Note
+// --telemetry* is retained even though the pinned CLI does not currently
+// wire argv into resolveTelemetrySettings(): env/settings already disable
+// telemetry, so this is inert defense in depth, not the load-bearing control
+// -- --yolo/--approval-mode/--skip-trust/--acp are the load-bearing ones,
+// since each maps directly to a real, verified bypass in pinned source.
 export const FORBIDDEN_FORWARD_ARG_PREFIXES = Object.freeze([
+  '--acp',
+  '--admin-policy',
+  '--approval-mode',
+  '--experimental-acp',
+  '--policy',
+  '--sandbox',
+  '--skip-trust',
   '--telemetry',
   '--telemetry-target',
   '--telemetry-otlp-endpoint',
   '--telemetry-otlp-protocol',
   '--telemetry-log-prompts',
   '--telemetry-outfile',
+  '--yolo',
 ]);
 
 function fail(message) {
@@ -142,6 +160,17 @@ function buildSettings(candidate) {
         enforcedType: AUTH_TYPES[candidate],
         useExternal: candidate === AUTH_CANDIDATES.GATEWAY,
       },
+    },
+    // The preflight already fails closed on a settings-driven ide.enabled
+    // (see phase-b-preflight.mjs's ide-mode-enabled-in-settings blocker), so
+    // an allowed=true report implies this is false upstream of this
+    // contract. Setting it explicitly here is defense in depth at the same
+    // precedence layer as every other isolated control below, matching the
+    // pattern already used for CLOUD_SHELL/GEMINI_CLI_USE_COMPUTE_ADC: it
+    // keeps this contract's own guarantee self-contained rather than
+    // silently relying on an upstream precondition holding forever.
+    ide: {
+      enabled: false,
     },
     advanced: {
       // Defense in depth only. Pinned 0.55.1 can still select trusted

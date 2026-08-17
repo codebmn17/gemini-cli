@@ -325,3 +325,60 @@ test('CLI fails closed generically for blocked/malformed input without raw detai
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Pinned 0.55.1 packages/cli/src/config/config.ts defines these as real
+// yargs flags capable of bypassing approval/trust/auth-routing regardless of
+// this contract's isolatedSettings/childEnvironment: --yolo and
+// --approval-mode=yolo both set ApprovalMode.YOLO (auto-approve all tools);
+// --skip-trust sets process.env.GEMINI_CLI_TRUST_WORKSPACE='true', the same
+// override checkPathTrust() consults first; --acp/--experimental-acp switch
+// to the ACP JSON-RPC surface, whose acpSessionManager/acpRpcDispatcher
+// construct AuthType directly and bypass validateAuthMethod() by a different
+// mechanism than security.auth.useExternal; --policy/--admin-policy load
+// additional policy files; --sandbox changes sandboxing. A future launcher
+// forwarding any of these would silently invalidate this contract's safety
+// argument even though isolatedSettings/childEnvironment themselves stay
+// correct.
+test('forbidden-forward list covers the real pinned flags capable of bypassing approval, trust, or auth routing', () => {
+  const required = [
+    '--yolo',
+    '--approval-mode',
+    '--skip-trust',
+    '--acp',
+    '--experimental-acp',
+    '--policy',
+    '--admin-policy',
+    '--sandbox',
+  ];
+  for (const prefix of required) {
+    assert.ok(
+      FORBIDDEN_FORWARD_ARG_PREFIXES.includes(prefix),
+      `missing forbidden prefix: ${prefix}`,
+    );
+  }
+});
+
+// checkPathTrust() (packages/core/src/utils/trust.ts) checks
+// GEMINI_CLI_TRUST_WORKSPACE === 'true' before anything else, unconditionally
+// trusting the workspace. --skip-trust (packages/cli/src/config/config.ts)
+// sets exactly this variable. If the parent shell already carries a truthy
+// value here (e.g. left over from a previous --skip-trust invocation), it
+// must not silently make the child more trusting than the preflight verified.
+test('GEMINI_CLI_TRUST_WORKSPACE is masked so an inherited truthy value cannot bypass verified trust', () => {
+  assert.ok(MASK_TO_EMPTY_ENV_KEYS.includes('GEMINI_CLI_TRUST_WORKSPACE'));
+});
+
+// config.ts: `const ideMode = settings.ide?.enabled ?? false;` gates whether
+// IdeClient.connect() runs at startup at all. The preflight already fails
+// closed on a settings-driven ide.enabled=true, but that is an upstream
+// precondition of this contract, not something this contract re-asserts on
+// its own -- explicitly forcing it false here keeps the guarantee
+// self-contained at the same isolated-settings precedence layer as every
+// other control, rather than resting silently on the preflight never
+// changing.
+test('isolated settings explicitly disable ide mode as defense in depth', () => {
+  for (const candidate of Object.values(AUTH_CANDIDATES)) {
+    const contract = build(candidate);
+    assert.equal(contract.isolatedSettings.ide.enabled, false);
+  }
+});
