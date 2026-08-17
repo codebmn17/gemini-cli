@@ -148,7 +148,12 @@ test('candidate-owned safe keys are not simultaneously mask-to-empty', () => {
   for (const key of Object.keys(contract.childEnvironment.set)) {
     assert.equal(masked.has(key), false, key);
   }
+  assert.equal(masked.has('GEMINI_CLI_HOME'), false);
   assert.equal(masked.has('GEMINI_CLI_SYSTEM_SETTINGS_PATH'), false);
+  assert.equal(
+    contract.childEnvironment.runtimeBindings.GEMINI_CLI_HOME,
+    'isolated-gemini-home-required',
+  );
   assert.equal(
     contract.childEnvironment.runtimeBindings.GEMINI_CLI_SYSTEM_SETTINGS_PATH,
     'isolated-settings-file-required',
@@ -328,21 +333,14 @@ test('CLI fails closed generically for blocked/malformed input without raw detai
 
 // Pinned 0.55.1 packages/cli/src/config/config.ts defines these as real
 // yargs flags capable of bypassing approval/trust/auth-routing regardless of
-// this contract's isolatedSettings/childEnvironment: --yolo and
-// --approval-mode=yolo both set ApprovalMode.YOLO (auto-approve all tools);
-// --skip-trust sets process.env.GEMINI_CLI_TRUST_WORKSPACE='true', the same
-// override checkPathTrust() consults first; --acp/--experimental-acp switch
-// to the ACP JSON-RPC surface, whose acpSessionManager/acpRpcDispatcher
-// construct AuthType directly and bypass validateAuthMethod() by a different
-// mechanism than security.auth.useExternal; --policy/--admin-policy load
-// additional policy files; --sandbox changes sandboxing. A future launcher
-// forwarding any of these would silently invalidate this contract's safety
-// argument even though isolatedSettings/childEnvironment themselves stay
-// correct.
+// this contract's isolatedSettings/childEnvironment. The future launcher is
+// closed-world and must not forward caller argv at all; these prefixes remain
+// an additional fail-closed guard and document known dangerous surfaces.
 test('forbidden-forward list covers the real pinned flags capable of bypassing approval, trust, or auth routing', () => {
   const required = [
     '--yolo',
     '--approval-mode',
+    '--allowed-tools',
     '--skip-trust',
     '--acp',
     '--experimental-acp',
@@ -381,4 +379,69 @@ test('isolated settings explicitly disable ide mode as defense in depth', () => 
     const contract = build(candidate);
     assert.equal(contract.isolatedSettings.ide.enabled, false);
   }
+});
+
+// Pinned 0.55.1 allows general.defaultApprovalMode='auto_edit', resolves
+// argv.allowedTools before settings.tools.allowed, and exposes hard security
+// switches for YOLO and persistent Always Allow behavior. The system-settings
+// layer wins over user/workspace values for these single-value controls.
+test('isolated settings pin confirmation semantics and remove approval bypasses', () => {
+  for (const candidate of Object.values(AUTH_CANDIDATES)) {
+    const settings = build(candidate).isolatedSettings;
+    assert.equal(settings.general.defaultApprovalMode, 'default');
+    assert.equal(settings.security.disableYoloMode, true);
+    assert.equal(settings.security.disableAlwaysAllow, true);
+    assert.deepEqual(settings.tools.allowed, []);
+  }
+});
+
+// This probe has no legitimate need for caller-controlled Gemini flags. A
+// closed-world policy avoids a perpetual denylist race with aliases and new
+// upstream flags; the forbidden-prefix list is only defense in depth.
+test('argv policy is closed-world and forbids arbitrary caller forwarding', () => {
+  const policy = build().argvPolicy;
+  assert.equal(policy.mode, 'launcher-owned-only');
+  assert.equal(policy.forwardCallerArgs, false);
+  assert.deepEqual(policy.injected, []);
+  assert.ok(policy.forbiddenForwardPrefixes.includes('--allowed-tools'));
+});
+
+// Pinned paths.ts honors GEMINI_CLI_HOME and storage.ts roots user settings,
+// credentials/state, trusted folders, commands, skills, policies, keybindings
+// and agents beneath that home. loadSettings() also uses process.cwd() for the
+// workspace scope, so the later launcher must isolate both persistent home
+// state and cwd rather than only redirecting the system settings file.
+test('runtime contract requires fresh private Gemini home, empty cwd, safe settings path, and cleanup', () => {
+  const contract = build();
+  assert.equal(
+    contract.childEnvironment.runtimeBindings.GEMINI_CLI_HOME,
+    'isolated-gemini-home-required',
+  );
+  assert.equal(
+    contract.childEnvironment.runtimeBindings.GEMINI_CLI_SYSTEM_SETTINGS_PATH,
+    'isolated-settings-file-required',
+  );
+  assert.equal(
+    contract.runtimeIsolation.runtimeRoot,
+    'fresh-private-temporary-directory-required',
+  );
+  assert.equal(
+    contract.runtimeIsolation.geminiHome,
+    'fresh-private-directory-under-runtime-root-required',
+  );
+  assert.equal(
+    contract.runtimeIsolation.workingDirectory,
+    'fresh-private-empty-directory-under-runtime-root-required',
+  );
+  assert.equal(
+    contract.runtimeIsolation.systemSettingsFile,
+    'fresh-regular-file-under-runtime-root-required',
+  );
+  assert.equal(contract.runtimeIsolation.rejectPreexistingRuntimePaths, true);
+  assert.equal(contract.runtimeIsolation.rejectSymlinkRuntimePaths, true);
+  assert.equal(contract.runtimeIsolation.cleanupRequired, true);
+  assert.equal(
+    contract.runtimeIsolation.nativeSystemPolicyHandling,
+    'deferred-before-tools-slice',
+  );
 });
