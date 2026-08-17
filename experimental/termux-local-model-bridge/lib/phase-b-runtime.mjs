@@ -295,19 +295,26 @@ function writePrivateSettings(settingsPath, settings) {
       noFollow,
     0o600,
   );
+  let keepOpen = false;
   try {
     fs.writeFileSync(descriptor, expectedText, 'utf8');
     fs.fsyncSync(descriptor);
+    fs.fchmodSync(descriptor, 0o600);
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile()) fail('isolated settings descriptor is not a regular file');
+    requirePrivateMode(stat, 'isolated settings file');
+    const pathStat = fs.lstatSync(settingsPath);
+    if (pathStat.isSymbolicLink() || !pathStat.isFile()) {
+      fail('isolated settings path is not a regular file');
+    }
+    if (pathStat.dev !== stat.dev || pathStat.ino !== stat.ino) {
+      fail('isolated settings path does not match its open descriptor');
+    }
+    keepOpen = true;
+    return { descriptor, stat, expectedText };
   } finally {
-    fs.closeSync(descriptor);
+    if (!keepOpen) fs.closeSync(descriptor);
   }
-  fs.chmodSync(settingsPath, 0o600);
-  const stat = fs.lstatSync(settingsPath);
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    fail('isolated settings path is not a regular file');
-  }
-  requirePrivateMode(stat, 'isolated settings file');
-  return { stat, expectedText };
 }
 
 function identity(stat) {
@@ -361,6 +368,8 @@ export function materializePhaseBRuntime({
   const safeTempParent = resolveSafeTempParent(tempParent);
 
   let runtimeRoot;
+  let settingsDescriptor;
+  let runtime;
   try {
     runtimeRoot = fs.mkdtempSync(path.join(safeTempParent, RUNTIME_PREFIX));
     const runtimeRootStat = verifyPrivateDirectory(runtimeRoot);
@@ -375,13 +384,14 @@ export function materializePhaseBRuntime({
       systemSettingsFile,
       contract.isolatedSettings,
     );
+    settingsDescriptor = settingsResult.descriptor;
 
     const childEnvironment = buildChildEnvironment(contract, parentEnv, {
       GEMINI_CLI_HOME: geminiHome,
       GEMINI_CLI_SYSTEM_SETTINGS_PATH: systemSettingsFile,
     });
 
-    const runtime = Object.freeze({
+    runtime = Object.freeze({
       schemaVersion: PHASE_B_RUNTIME_SCHEMA_VERSION,
       runtimeRoot,
       geminiHome,
@@ -393,6 +403,7 @@ export function materializePhaseBRuntime({
     });
     ACTIVE_RUNTIMES.set(runtime, {
       runtimeRoot,
+      settingsDescriptor,
       expectedSettingsText: settingsResult.expectedText,
       identities: {
         runtimeRoot: identity(runtimeRootStat),
@@ -404,6 +415,14 @@ export function materializePhaseBRuntime({
     verifyPhaseBRuntime(runtime);
     return runtime;
   } catch (error) {
+    if (runtime) ACTIVE_RUNTIMES.delete(runtime);
+    if (settingsDescriptor !== undefined) {
+      try {
+        fs.closeSync(settingsDescriptor);
+      } catch {
+        // Preserve the original fail-closed error.
+      }
+    }
     if (runtimeRoot) {
       try {
         removeRuntimeRoot(runtimeRoot);
@@ -417,6 +436,18 @@ export function materializePhaseBRuntime({
 
 export function verifyPhaseBRuntime(runtime) {
   const metadata = requireActiveRuntime(runtime);
+  const heldSettingsStat = fs.fstatSync(metadata.settingsDescriptor);
+  if (!heldSettingsStat.isFile()) fail('held settings descriptor changed type');
+  requirePrivateMode(heldSettingsStat, 'held settings descriptor');
+  if (
+    !sameIdentity(
+      heldSettingsStat,
+      metadata.identities.systemSettingsFile,
+    )
+  ) {
+    fail('held settings descriptor identity changed');
+  }
+
   const checks = [
     ['runtimeRoot', runtime.runtimeRoot, 'directory'],
     ['geminiHome', runtime.geminiHome, 'directory'],
@@ -457,6 +488,10 @@ export function verifyPhaseBRuntime(runtime) {
 
 export function cleanupPhaseBRuntime(runtime) {
   const metadata = requireActiveRuntime(runtime);
-  removeRuntimeRoot(metadata.runtimeRoot);
-  ACTIVE_RUNTIMES.delete(runtime);
+  try {
+    fs.closeSync(metadata.settingsDescriptor);
+  } finally {
+    removeRuntimeRoot(metadata.runtimeRoot);
+    ACTIVE_RUNTIMES.delete(runtime);
+  }
 }
