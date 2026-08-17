@@ -259,20 +259,33 @@ function resolveSafeTempParent(tempParent) {
   return resolved;
 }
 
+function requirePrivateMode(stat, label) {
+  if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0) {
+    fail(`${label} permissions are not private`);
+  }
+}
+
 function verifyPrivateDirectory(directoryPath) {
   fs.chmodSync(directoryPath, 0o700);
   const stat = fs.lstatSync(directoryPath);
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
     fail('runtime directory is not a real directory');
   }
+  requirePrivateMode(stat, 'runtime directory');
+  return stat;
 }
 
 function createPrivateDirectory(directoryPath) {
   fs.mkdirSync(directoryPath, { mode: 0o700 });
-  verifyPrivateDirectory(directoryPath);
+  return verifyPrivateDirectory(directoryPath);
+}
+
+function settingsText(settings) {
+  return `${JSON.stringify(settings, null, 2)}\n`;
 }
 
 function writePrivateSettings(settingsPath, settings) {
+  const expectedText = settingsText(settings);
   const noFollow = fs.constants.O_NOFOLLOW ?? 0;
   const descriptor = fs.openSync(
     settingsPath,
@@ -283,7 +296,7 @@ function writePrivateSettings(settingsPath, settings) {
     0o600,
   );
   try {
-    fs.writeFileSync(descriptor, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+    fs.writeFileSync(descriptor, expectedText, 'utf8');
     fs.fsyncSync(descriptor);
   } finally {
     fs.closeSync(descriptor);
@@ -293,6 +306,16 @@ function writePrivateSettings(settingsPath, settings) {
   if (!stat.isFile() || stat.isSymbolicLink()) {
     fail('isolated settings path is not a regular file');
   }
+  requirePrivateMode(stat, 'isolated settings file');
+  return { stat, expectedText };
+}
+
+function identity(stat) {
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function sameIdentity(stat, expected) {
+  return stat.dev === expected.dev && stat.ino === expected.ino;
 }
 
 function buildChildEnvironment(contract, parentEnv, runtimeBindings) {
@@ -320,6 +343,15 @@ function removeRuntimeRoot(runtimeRoot) {
   }
 }
 
+function requireActiveRuntime(runtime) {
+  if (!isPlainObject(runtime) || !Object.isFrozen(runtime)) {
+    fail('runtime handle is invalid');
+  }
+  const metadata = ACTIVE_RUNTIMES.get(runtime);
+  if (!metadata) fail('runtime handle is unknown or already cleaned');
+  return metadata;
+}
+
 export function materializePhaseBRuntime({
   contract,
   parentEnv = process.env,
@@ -331,15 +363,18 @@ export function materializePhaseBRuntime({
   let runtimeRoot;
   try {
     runtimeRoot = fs.mkdtempSync(path.join(safeTempParent, RUNTIME_PREFIX));
-    verifyPrivateDirectory(runtimeRoot);
+    const runtimeRootStat = verifyPrivateDirectory(runtimeRoot);
 
     const geminiHome = path.join(runtimeRoot, 'gemini-home');
     const workingDirectory = path.join(runtimeRoot, 'cwd');
     const systemSettingsFile = path.join(runtimeRoot, 'system-settings.json');
 
-    createPrivateDirectory(geminiHome);
-    createPrivateDirectory(workingDirectory);
-    writePrivateSettings(systemSettingsFile, contract.isolatedSettings);
+    const geminiHomeStat = createPrivateDirectory(geminiHome);
+    const workingDirectoryStat = createPrivateDirectory(workingDirectory);
+    const settingsResult = writePrivateSettings(
+      systemSettingsFile,
+      contract.isolatedSettings,
+    );
 
     const childEnvironment = buildChildEnvironment(contract, parentEnv, {
       GEMINI_CLI_HOME: geminiHome,
@@ -356,7 +391,17 @@ export function materializePhaseBRuntime({
       launcherArgs: Object.freeze([]),
       executableLaunchImplemented: false,
     });
-    ACTIVE_RUNTIMES.set(runtime, runtimeRoot);
+    ACTIVE_RUNTIMES.set(runtime, {
+      runtimeRoot,
+      expectedSettingsText: settingsResult.expectedText,
+      identities: {
+        runtimeRoot: identity(runtimeRootStat),
+        geminiHome: identity(geminiHomeStat),
+        workingDirectory: identity(workingDirectoryStat),
+        systemSettingsFile: identity(settingsResult.stat),
+      },
+    });
+    verifyPhaseBRuntime(runtime);
     return runtime;
   } catch (error) {
     if (runtimeRoot) {
@@ -370,12 +415,48 @@ export function materializePhaseBRuntime({
   }
 }
 
-export function cleanupPhaseBRuntime(runtime) {
-  if (!isPlainObject(runtime) || !Object.isFrozen(runtime)) {
-    fail('runtime handle is invalid');
+export function verifyPhaseBRuntime(runtime) {
+  const metadata = requireActiveRuntime(runtime);
+  const checks = [
+    ['runtimeRoot', runtime.runtimeRoot, 'directory'],
+    ['geminiHome', runtime.geminiHome, 'directory'],
+    ['workingDirectory', runtime.workingDirectory, 'directory'],
+    ['systemSettingsFile', runtime.systemSettingsFile, 'file'],
+  ];
+
+  for (const [key, targetPath, kind] of checks) {
+    const stat = fs.lstatSync(targetPath);
+    if (stat.isSymbolicLink()) fail(`${key} became a symbolic link`);
+    if (kind === 'directory' ? !stat.isDirectory() : !stat.isFile()) {
+      fail(`${key} changed filesystem type`);
+    }
+    requirePrivateMode(stat, key);
+    if (!sameIdentity(stat, metadata.identities[key])) {
+      fail(`${key} identity changed after materialization`);
+    }
   }
-  const runtimeRoot = ACTIVE_RUNTIMES.get(runtime);
-  if (!runtimeRoot) fail('runtime handle is unknown or already cleaned');
-  removeRuntimeRoot(runtimeRoot);
+
+  if (!arraysEqual(fs.readdirSync(runtime.workingDirectory), [])) {
+    fail('working directory is no longer empty');
+  }
+  if (
+    fs.readFileSync(runtime.systemSettingsFile, 'utf8') !==
+    metadata.expectedSettingsText
+  ) {
+    fail('isolated settings file changed after materialization');
+  }
+  if (
+    runtime.childEnvironment.GEMINI_CLI_HOME !== runtime.geminiHome ||
+    runtime.childEnvironment.GEMINI_CLI_SYSTEM_SETTINGS_PATH !==
+      runtime.systemSettingsFile
+  ) {
+    fail('runtime environment bindings no longer match runtime paths');
+  }
+  return true;
+}
+
+export function cleanupPhaseBRuntime(runtime) {
+  const metadata = requireActiveRuntime(runtime);
+  removeRuntimeRoot(metadata.runtimeRoot);
   ACTIVE_RUNTIMES.delete(runtime);
 }
