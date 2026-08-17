@@ -1,0 +1,8 @@
+{
+  "name": "gemini-local-model-bridge-experiment",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
