@@ -11,6 +11,7 @@ import {
   cleanupPhaseBRuntime,
   materializePhaseBRuntime,
   validateAuthRoutingContractForRuntime,
+  verifyPhaseBRuntime,
 } from '../lib/phase-b-runtime.mjs';
 import { LOCAL_PLACEHOLDER_API_KEY } from '../lib/phase-b-recorder.mjs';
 
@@ -103,6 +104,7 @@ test('materializes a fresh private runtime with empty cwd and exact isolated set
       fs.readFileSync(runtime.systemSettingsFile, 'utf8'),
     );
     assert.deepEqual(writtenSettings, contract.isolatedSettings);
+    assert.equal(verifyPhaseBRuntime(runtime), true);
 
     if (process.platform !== 'win32') {
       assert.equal(modeBits(runtime.runtimeRoot), 0o700);
@@ -127,6 +129,7 @@ test('default materialization accepts Node process.env rather than requiring a p
     });
     assert.equal(runtime.childEnvironment.GEMINI_API_KEY, LOCAL_PLACEHOLDER_API_KEY);
     assert.equal(runtime.childEnvironment.GEMINI_CLI_HOME, runtime.geminiHome);
+    assert.equal(verifyPhaseBRuntime(runtime), true);
   } finally {
     if (runtime) cleanupPhaseBRuntime(runtime);
     fs.rmSync(tempParent, { recursive: true, force: true });
@@ -178,6 +181,32 @@ test('builds child environment in copy-mask-set-runtime order without mutating p
       runtime.childEnvironment.GEMINI_CLI_SYSTEM_SETTINGS_PATH,
       '/real/system/settings.json',
     );
+  } finally {
+    if (runtime) cleanupPhaseBRuntime(runtime);
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+test('integrity recheck rejects cwd contamination and settings-file replacement', () => {
+  const tempParent = makeTempParent();
+  let runtime;
+  try {
+    runtime = materializePhaseBRuntime({
+      contract: buildContract(),
+      parentEnv: {},
+      tempParent,
+    });
+
+    const unexpected = path.join(runtime.workingDirectory, 'unexpected.txt');
+    fs.writeFileSync(unexpected, 'not empty');
+    assert.throws(() => verifyPhaseBRuntime(runtime));
+    fs.unlinkSync(unexpected);
+    assert.equal(verifyPhaseBRuntime(runtime), true);
+
+    const settingsText = fs.readFileSync(runtime.systemSettingsFile, 'utf8');
+    fs.unlinkSync(runtime.systemSettingsFile);
+    fs.writeFileSync(runtime.systemSettingsFile, settingsText, { mode: 0o600 });
+    assert.throws(() => verifyPhaseBRuntime(runtime));
   } finally {
     if (runtime) cleanupPhaseBRuntime(runtime);
     fs.rmSync(tempParent, { recursive: true, force: true });
