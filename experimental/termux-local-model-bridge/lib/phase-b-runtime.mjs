@@ -4,10 +4,12 @@ import path from 'node:path';
 import {
   AUTH_CANDIDATES,
   AUTH_ROUTING_SCHEMA_VERSION,
+  MASK_TO_EMPTY_ENV_KEYS,
   PINNED_GEMINI_CLI_COMMIT,
   PINNED_GEMINI_CLI_VERSION,
   normalizeRecorderOrigin,
 } from './phase-b-auth-routing.mjs';
+import { LOCAL_PLACEHOLDER_API_KEY } from './phase-b-recorder.mjs';
 
 export const PHASE_B_RUNTIME_SCHEMA_VERSION = 1;
 const RUNTIME_PREFIX = 'gemini-local-phase-b-';
@@ -31,6 +33,21 @@ function isPlainObject(value) {
 
 function requirePlainObject(value, label) {
   if (!isPlainObject(value)) fail(`${label} must be a plain object`);
+  return value;
+}
+
+function requireEnvironmentRecord(value, label) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    fail(`${label} must be an environment-like object`);
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (
+      key.length === 0 ||
+      (typeof item !== 'string' && item !== undefined)
+    ) {
+      fail(`${label} must contain only string or undefined values`);
+    }
+  }
   return value;
 }
 
@@ -60,6 +77,32 @@ function arraysEqual(left, right) {
     left.length === right.length &&
     left.every((value, index) => value === right[index])
   );
+}
+
+function stringRecordsEqual(actual, expected) {
+  const actualKeys = Object.keys(actual).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return (
+    arraysEqual(actualKeys, expectedKeys) &&
+    expectedKeys.every((key) => actual[key] === expected[key])
+  );
+}
+
+function expectedSafeEnvironment(recorderOrigin) {
+  return {
+    GEMINI_API_KEY: LOCAL_PLACEHOLDER_API_KEY,
+    GOOGLE_GEMINI_BASE_URL: recorderOrigin,
+    GEMINI_API_KEY_AUTH_MECHANISM: 'x-goog-api-key',
+    GEMINI_TELEMETRY_ENABLED: 'false',
+    GEMINI_TELEMETRY_TRACES_ENABLED: 'false',
+    GEMINI_TELEMETRY_LOG_PROMPTS: 'false',
+    GEMINI_TELEMETRY_USE_COLLECTOR: 'false',
+    GEMINI_TELEMETRY_USE_CLI_AUTH: 'false',
+    GEMINI_TELEMETRY_TARGET: 'local',
+    GEMINI_TELEMETRY_OTLP_PROTOCOL: 'http',
+    GEMINI_TELEMETRY_OTLP_ENDPOINT: 'http://127.0.0.1:1',
+    OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:1',
+  };
 }
 
 export function validateAuthRoutingContractForRuntime(contract) {
@@ -99,19 +142,24 @@ export function validateAuthRoutingContractForRuntime(contract) {
     childEnvironment.maskToEmpty,
     'childEnvironment.maskToEmpty',
   );
+  if (!arraysEqual(maskToEmpty, [...MASK_TO_EMPTY_ENV_KEYS])) {
+    fail('childEnvironment mask set does not match the reviewed contract');
+  }
   const setValues = requireStringRecord(childEnvironment.set, 'childEnvironment.set');
+  if (!stringRecordsEqual(setValues, expectedSafeEnvironment(contract.recorderOrigin))) {
+    fail('childEnvironment safe literals do not match the reviewed contract');
+  }
   const runtimeBindings = requireStringRecord(
     childEnvironment.runtimeBindings,
     'childEnvironment.runtimeBindings',
   );
-  if (runtimeBindings.GEMINI_CLI_HOME !== 'isolated-gemini-home-required') {
-    fail('GEMINI_CLI_HOME runtime binding is missing');
-  }
   if (
-    runtimeBindings.GEMINI_CLI_SYSTEM_SETTINGS_PATH !==
-    'isolated-settings-file-required'
+    !stringRecordsEqual(runtimeBindings, {
+      GEMINI_CLI_HOME: 'isolated-gemini-home-required',
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: 'isolated-settings-file-required',
+    })
   ) {
-    fail('system-settings runtime binding is missing');
+    fail('runtime bindings do not match the reviewed contract');
   }
 
   const masked = new Set(maskToEmpty);
@@ -248,8 +296,8 @@ function writePrivateSettings(settingsPath, settings) {
 }
 
 function buildChildEnvironment(contract, parentEnv, runtimeBindings) {
-  requirePlainObject(parentEnv, 'parent environment');
-  const child = {};
+  requireEnvironmentRecord(parentEnv, 'parent environment');
+  const child = Object.create(null);
   for (const [key, value] of Object.entries(parentEnv)) {
     if (typeof value === 'string') child[key] = value;
   }
@@ -323,7 +371,7 @@ export function materializePhaseBRuntime({
 }
 
 export function cleanupPhaseBRuntime(runtime) {
-  if (!isPlainObject(runtime) && !Object.isFrozen(runtime)) {
+  if (!isPlainObject(runtime) || !Object.isFrozen(runtime)) {
     fail('runtime handle is invalid');
   }
   const runtimeRoot = ACTIVE_RUNTIMES.get(runtime);
