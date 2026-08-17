@@ -154,9 +154,35 @@ local-only route. At `v0.55.1`, `createContentGeneratorConfig()` reads
 `GEMINI_API_KEY` for the `GATEWAY` branch, `createContentGenerator()` merges
 `GEMINI_CLI_CUSTOM_HEADERS` into model request headers, and
 `packages/cli/src/config/config.ts` derives `Config.proxy` from
-`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, or `http_proxy`. A local wrapper
-must therefore isolate those transport inputs rather than assuming a loopback
-base URL alone prevents credential or proxy inheritance.
+`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, or `http_proxy`. The same content
+-generator path reads `GOOGLE_GENAI_API_VERSION`, which can change the protocol
+version sent to the custom endpoint. A local wrapper must therefore isolate
+those transport inputs rather than assuming a loopback base URL alone prevents
+credential, header, proxy, or protocol-shape inheritance.
+
+There is a second environment boundary above those reads. Every normal startup
+runs `loadEnvironment()` from `packages/cli/src/config/settings.ts`. That loader
+finds a Gemini-specific or generic `.env` file and loads keys that are not
+already own properties of `process.env`. Gemini-specific `.gemini/.env` lookup
+is not disabled by `advanced.ignoreLocalEnv` or `--ignore-env`. Therefore
+*deleting* a sensitive variable in the wrapper is not enough: a discovered
+`.env` can restore it before model configuration is built. An explicit empty
+string is different because `Object.hasOwn(process.env, key)` is then true, so
+the loader leaves the wrapper-controlled value in place.
+
+`createContentGenerator()` also adds
+`x-gemini-api-privileged-user-id` when
+`settings.privacy.usageStatisticsEnabled` is true. That value is a stable local
+installation identifier and is independent of `GEMINI_TELEMETRY_ENABLED`.
+Local mode does not need that identifier, so the child-only settings layer must
+disable usage statistics before any recorder or bridge request is sent.
+
+For proxied environments, `packages/core/src/utils/fetch.ts` confirms that the
+global `EnvHttpProxyAgent` reads `NO_PROXY`/`no_proxy`. Appending loopback hosts
+to that exclusion could eventually preserve an ambient proxy for other traffic
+while keeping the model bridge direct. That is a source-supported future option,
+not a V1 assumption; it still requires device proof before replacing V1's
+fail-closed proxy rule.
 
 ### Upstream-tracking branch pin
 
@@ -172,6 +198,21 @@ This distinction is deliberate:
   against.
 - A future `Gemini CLI` update requires a bounded compatibility recheck, not a
   permanent source fork.
+
+### Future derivative-fork escape hatch
+
+The pinned `v0.55.1` source is licensed under Apache License 2.0. That license
+permits modification and redistribution of derivative works subject to its
+license, attribution, retained-notice, and changed-file requirements, while not
+granting rights to Google's trademarks or product names. Therefore a future
+architecture review can consider a separately named derivative CLI in a
+separate repository if the external compatibility seam becomes materially more
+complex or brittle than maintaining a source derivative.
+
+That option is deliberately not activated by this plan. Before any derivative
+fork is created for distribution, recheck the exact source revision's license,
+third-party dependency notices, naming/branding, and distribution obligations.
+The current V1 remains adapter-first and keeps the upstream package untouched.
 
 ## Goal
 
@@ -250,8 +291,13 @@ Every implementation and review pass must preserve these invariants.
 15. Local mode must not weaken or silently replace existing system settings,
     system defaults, approval policy, authentication policy, or security policy.
 16. Local model traffic must not inherit a real Gemini API key, custom Gemini
-    request headers, or an ambient HTTP(S) proxy without an explicitly reviewed
-    local-mode transport policy.
+    request headers, an ambient API-version override, or an ambient HTTP(S) proxy
+    without an explicitly reviewed local-mode transport policy.
+17. Wrapper-controlled transport variables must remain controlled even after
+    Gemini CLI's own `.env` loader runs.
+18. Local model traffic must not send Gemini CLI's stable installation identifier
+    merely because hosted-mode usage statistics are enabled in the user's normal
+    settings.
 
 ## Local installation layout
 
@@ -314,27 +360,46 @@ approval, authentication, admin, workspace, or security policy merely to enable
 local inference. Remote admin controls remain owned by `Gemini CLI`; this plan
 does not claim the file-path override changes their behavior.
 
-Before either auth candidate launches, the wrapper must establish a sanitized
-model-transport environment:
+The bridge-owned local-mode settings file must also set
+`privacy.usageStatisticsEnabled: false`. This is child-process-only state and
+prevents `x-gemini-api-privileged-user-id` from being attached to local model
+requests. It is separate from `GEMINI_TELEMETRY_ENABLED=0`.
 
-- Candidate 2 must explicitly remove any inherited `GEMINI_API_KEY` from the
-  child process before launching `gemini`. The `GATEWAY` source path otherwise
-  reads that variable and can forward its value to the custom base URL.
-- Both candidates must remove inherited `GEMINI_CLI_CUSTOM_HEADERS` for V1.
-  Future custom local headers require an explicit reviewed profile; arbitrary
-  hosted-provider headers must not cross into the localhost bridge.
+Before either auth candidate launches, the wrapper must establish a sanitized
+model-transport environment that survives Gemini CLI's `.env` loading:
+
+- Candidate 2 must set `GEMINI_API_KEY` to an explicit empty string rather than
+  delete or unset it. `loadEnvironment()` only loads a `.env` key when that key
+  is not already an own property of `process.env`; the empty string therefore
+  blocks a real key in a discovered `.env` from being restored. The `GATEWAY`
+  source path then resolves that empty value to its supported no-key case.
+- Both candidates must set `GEMINI_CLI_CUSTOM_HEADERS` to an explicit empty
+  string. Deleting it is insufficient because `.env` loading can restore it;
+  the empty value blocks restoration and `createContentGenerator()` treats it
+  as no custom-header input.
+- Both candidates must set `GOOGLE_GENAI_API_VERSION` to an explicit empty
+  string. This blocks a discovered `.env` from changing the local protocol
+  version while leaving the SDK's normal default behavior in force.
 - Candidate 1 must set its own non-secret placeholder `GEMINI_API_KEY` and set
   `GEMINI_API_KEY_AUTH_MECHANISM=x-goog-api-key` so an inherited bearer-mode
   preference cannot change the proof's authentication header shape.
-- If any of `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, or `http_proxy` is set,
-  V1 must fail closed before launching local mode. `v0.55.1` converts those
-  variables into the model transport's proxy agent, so a loopback base URL is
-  not sufficient proof of a direct loopback connection. V1 must not silently
-  clear those variables because doing so would also change the environment seen
-  by CLI-launched tools. A future proxy-preserving local-mode design requires a
-  separate review.
-- These checks must never print credential values, custom-header values, or
-  proxy URLs. Record only presence/absence and the resulting local-mode action.
+- Before launch, determine which `.env` file the installed CLI would select
+  under its own `findEnvFile()` rules. Record only the selected path category
+  and whether sensitive transport keys are present; never print their values.
+- If any of `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, or `http_proxy` is set in
+  the inherited shell environment *or present in the `.env` file Gemini would
+  load*, V1 must fail closed before launching local mode. `v0.55.1` can convert
+  those variables into the process-wide model transport proxy. V1 must not
+  silently clear them because doing so can also change the environment seen by
+  CLI-launched tools.
+- A future proxy-preserving local profile may append `127.0.0.1`, `localhost`,
+  and `::1` to the existing `NO_PROXY`/`no_proxy` value while leaving the proxy
+  itself intact. Source shows the global proxy dispatcher consumes that
+  exclusion, but the behavior remains device-test-gated before V1 can rely on
+  it.
+- These checks must never print credential values, custom-header values, API
+  version values, proxy URLs, or `.env` secret contents. Record only
+  presence/absence and the resulting local-mode action.
 
 The first implementation must therefore test two candidate minimal
 environments and record which one, if either, actually reaches the bridge for
@@ -348,12 +413,14 @@ GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<bridge-port>
 GEMINI_TELEMETRY_ENABLED=0
 GEMINI_API_KEY=<local-placeholder-value>
 GEMINI_API_KEY_AUTH_MECHANISM=x-goog-api-key
+GEMINI_CLI_CUSTOM_HEADERS=
+GOOGLE_GENAI_API_VERSION=
 ```
 
-with inherited `GEMINI_CLI_CUSTOM_HEADERS` removed and no ambient HTTP(S) proxy,
-plus a bridge-owned settings file (pointed to by
-`GEMINI_CLI_SYSTEM_SETTINGS_PATH`, process-scoped) that sets
-`security.auth.selectedType` to `gemini-api-key`. This is the auth type the
+with no ambient proxy in the inherited shell or selected `.env`, plus a
+bridge-owned settings file (pointed to by `GEMINI_CLI_SYSTEM_SETTINGS_PATH`,
+process-scoped) that sets `security.auth.selectedType` to `gemini-api-key` and
+`privacy.usageStatisticsEnabled` to `false`. This is the auth type the
 `v0.55.1` configuration reference documents `GOOGLE_GEMINI_BASE_URL` against,
 it has an explicit, passing branch in `validateAuthMethod()`, and it reaches
 the same `baseUrl`-override code in `contentGenerator.ts` that the `GATEWAY`
@@ -363,19 +430,18 @@ bridge can additionally check for this exact placeholder as a defense against
 stray loopback traffic from other local processes.
 
 Candidate 2 (`GATEWAY` route): the same process-scoped bridge-owned settings file
-sets both `security.auth.useExternal: true` and
-`security.auth.selectedType: "gateway"` for interactive and non-interactive
-local-mode invocations. The wrapper must explicitly remove inherited
-`GEMINI_API_KEY` and `GEMINI_CLI_CUSTOM_HEADERS` before launch, and the candidate
-must run with no ambient HTTP(S) proxy. Both settings are required on the target
-device because an already-persisted selected auth type wins before
+sets both `security.auth.useExternal: true`,
+`security.auth.selectedType: "gateway"`, and
+`privacy.usageStatisticsEnabled: false` for interactive and non-interactive
+local-mode invocations. The wrapper sets `GEMINI_API_KEY=`,
+`GEMINI_CLI_CUSTOM_HEADERS=`, and `GOOGLE_GENAI_API_VERSION=` as explicit empty
+values before launch, and the candidate must run with no ambient HTTP(S) proxy
+in the inherited shell or selected `.env`. Both auth settings are required on
+the target device because an already-persisted selected auth type wins before
 `getAuthTypeFromEnv()` in non-interactive mode and is read directly in
-interactive mode. This matches the plan's original intent of never requiring a
-placeholder credential, but depends on settings-layer behavior (`useExternal`
-bypassing `validateAuthMethod()` and the higher-precedence system settings layer
-overriding the persisted selected type) that must be device-verified before it
-is trusted, since it is not covered by the project's own auth test suites for
-the non-`--acp` invocation path.
+interactive mode. The explicit empty environment values are required because
+Gemini CLI's startup `.env` loader can otherwise restore an unset value before
+the content generator is created.
 
 Phase B must run both candidates against the installed `0.55.1` binary and
 record which one actually reaches the loopback recorder, in both interactive
@@ -412,7 +478,8 @@ embedContent
 Do not freeze exact paths for those two operations until the localhost contract
 probe records the installed `0.55.1` requests. The bridge router must support
 the API version actually received rather than hard-coding `v1beta` throughout
-its internal logic.
+its internal logic. V1 neutralizes an inherited `GOOGLE_GENAI_API_VERSION` so
+this capture begins from the installed SDK's default protocol behavior.
 
 ## Compatibility surface
 
@@ -670,9 +737,10 @@ The bridge must:
 - never forward Google credentials to a backend.
 
 The wrapper's transport boundary is part of the same security posture. It must
-prevent inherited provider credentials or custom provider headers from reaching
-the bridge, and it must reject ambient HTTP(S) proxy configuration in V1 rather
-than assuming a loopback URL bypasses that proxy.
+prevent inherited or `.env`-restored provider credentials, custom provider
+headers, protocol-version overrides, and stable usage-statistics identifiers
+from reaching the bridge. It must reject ambient HTTP(S) proxy configuration in
+V1 rather than assuming a loopback URL bypasses that proxy.
 
 Local mode must keep normal `Gemini CLI` tool confirmation behavior. The wrapper
 must not set YOLO or another permissive approval mode automatically.
@@ -704,6 +772,11 @@ Version 1 must use precise language.
 `GEMINI_TELEMETRY_ENABLED` environment override. The local wrapper can disable
 Gemini CLI telemetry for its child process without changing normal hosted mode.
 
+Usage statistics are a separate setting. Local mode also sets
+`privacy.usageStatisticsEnabled: false` in its child-only settings layer so the
+stable `x-gemini-api-privileged-user-id` installation identifier is not attached
+to bridge requests.
+
 Other features can still contact external services, including user-configured
 MCP servers, extensions, update checks, or tools. Therefore strict offline mode
 requires its own egress test before it is advertised.
@@ -733,11 +806,15 @@ Every failure mode must be designed before happy-path polish.
 - Local profile missing: wrapper fails before launching `gemini`.
 - Existing system settings/defaults would be shadowed: wrapper fails before
   launching local mode until a reviewed preservation strategy exists.
-- Ambient HTTP(S) proxy detected: V1 fails before launching local mode rather
-  than proxying loopback traffic or silently clearing the user's tool proxy.
-- Candidate 2 cannot prove inherited `GEMINI_API_KEY` was removed, or either
-  candidate cannot prove inherited Gemini custom headers were removed: wrapper
-  fails before launching local mode.
+- Ambient HTTP(S) proxy detected in the inherited shell or selected `.env`: V1
+  fails before launching local mode rather than proxying loopback traffic or
+  silently clearing the user's tool proxy.
+- Wrapper cannot hold `GEMINI_API_KEY`, `GEMINI_CLI_CUSTOM_HEADERS`, or
+  `GOOGLE_GENAI_API_VERSION` to the candidate-specific explicit values through
+  Gemini CLI's `.env` load: wrapper fails before launching local mode.
+- Child-only `privacy.usageStatisticsEnabled: false` is not effective: stop the
+  recorder test rather than accepting a stable installation identifier in local
+  model traffic.
 
 No local-mode failure may silently retry against a Google model endpoint.
 
@@ -755,6 +832,8 @@ Completion proof:
 - reviewers agree on the no-source-patch architecture,
 - the installed-version pin is confirmed,
 - the temporary Git workflow is accepted,
+- the derivative-fork option remains explicitly deferred rather than silently
+  becoming V1 scope,
 - no runtime code exists yet.
 
 ### Phase B: capture the installed localhost contract
@@ -773,38 +852,50 @@ Before any settings-path override or auth candidate is attempted:
 4. If either file exists, stop the candidate probe and return to review until a
    preservation/composition strategy is accepted. Do not replace an existing
    system policy/settings layer for the sake of local mode.
-5. Record only presence/absence, never values, for inherited
-   `GEMINI_API_KEY`, `GEMINI_CLI_CUSTOM_HEADERS`, `HTTPS_PROXY`, `https_proxy`,
-   `HTTP_PROXY`, and `http_proxy`.
-6. If any HTTP(S) proxy variable is present, stop the V1 candidate probe and
-   return to review rather than silently changing the user's broader tool
-   environment.
+5. Reproduce the installed `findEnvFile()` selection read-only and record which
+   source category would be loaded: workspace `.gemini/.env`, generic `.env`,
+   home `.gemini/.env`, home `.env`, or none. Do not print file contents.
+6. Record only presence/absence, never values, for inherited and selected-`.env`
+   `GEMINI_API_KEY`, `GEMINI_CLI_CUSTOM_HEADERS`, `GOOGLE_GENAI_API_VERSION`,
+   `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, and `http_proxy`.
+7. If any HTTP(S) proxy variable is present in either source, stop the V1
+   candidate probe and return to review rather than silently changing the
+   user's broader tool environment. The separately reviewed `NO_PROXY` approach
+   can be tested later if a proxied target actually needs local mode.
 
 Once that prerequisite is satisfied, test in this order:
 
 1. Launch a recorder on `127.0.0.1`.
 2. Run the documented `USE_GEMINI` candidate non-interactively with the
-   bridge-owned settings layer forcing `selectedType: "gemini-api-key"`, a
-   wrapper-owned placeholder `GEMINI_API_KEY`,
-   `GEMINI_API_KEY_AUTH_MECHANISM=x-goog-api-key`, inherited
-   `GEMINI_CLI_CUSTOM_HEADERS` removed, and the base URL redirected to the
-   recorder.
+   bridge-owned settings layer forcing `selectedType: "gemini-api-key"` and
+   `privacy.usageStatisticsEnabled: false`, a wrapper-owned placeholder
+   `GEMINI_API_KEY`, `GEMINI_API_KEY_AUTH_MECHANISM=x-goog-api-key`, explicit
+   empty `GEMINI_CLI_CUSTOM_HEADERS` and `GOOGLE_GENAI_API_VERSION`, and the
+   base URL redirected to the recorder.
 3. Separately run the `GATEWAY` candidate non-interactively with the bridge-owned
-   settings layer forcing both `security.auth.useExternal: true` and
-   `security.auth.selectedType: "gateway"`, inherited `GEMINI_API_KEY` and
-   `GEMINI_CLI_CUSTOM_HEADERS` explicitly removed, and the base URL redirected
-   to the recorder. The probe must not inherit the persisted hosted auth type or
-   a hosted-provider credential/header.
+   settings layer forcing `security.auth.useExternal: true`,
+   `security.auth.selectedType: "gateway"`, and
+   `privacy.usageStatisticsEnabled: false`; set `GEMINI_API_KEY=`,
+   `GEMINI_CLI_CUSTOM_HEADERS=`, and `GOOGLE_GENAI_API_VERSION=` explicitly in
+   the child environment and redirect the base URL to the recorder. The probe
+   must not inherit the persisted hosted auth type or a hosted-provider
+   credential/header/protocol override.
 4. Repeat candidates 2 and 3 for an interactive session, since interactive
    startup has its own auth path and needs independent proof.
 5. Issue a harmless prompt that reaches the recorder.
-6. Record method, path, selected safe headers, and request shape. Never record
-   credential values or arbitrary custom-header values.
-7. Return a deliberate local error or static response.
-8. Confirm no hosted model request was needed for the proof.
-9. Repeat for streaming.
-10. Trigger representative flows that reveal `countTokens` and embedding usage.
-11. Record cancellation behavior.
+6. Record method, path, content type, and an allowlisted set of safe header
+   *properties* only. Do not persist arbitrary raw headers. For Candidate 1,
+   compare the auth header to the known wrapper placeholder without storing it.
+   For Candidate 2, require an empty or absent credential value as dictated by
+   the observed SDK shape. Reject any `Authorization` header or nonempty
+   `x-goog-api-key` value.
+7. Assert `x-gemini-api-privileged-user-id` is absent. If present, stop and fix
+   the settings isolation before continuing.
+8. Return a deliberate local error or static response.
+9. Confirm no hosted model request was needed for the proof.
+10. Repeat for streaming.
+11. Trigger representative flows that reveal `countTokens` and embedding usage.
+12. Record cancellation behavior.
 
 This phase decides which auth candidate from the wrapper contract actually
 reaches the installed bundle, in both interactive and non-interactive mode, and
@@ -816,10 +907,17 @@ Completion proof:
 - native system-settings and system-defaults paths and file-existence results are
   recorded,
 - no existing native system policy/settings layer was silently replaced,
-- ambient proxy presence was checked without logging proxy URLs,
-- Candidate 2 proves that inherited `GEMINI_API_KEY` does not reach the bridge,
-- both candidates prove inherited `GEMINI_CLI_CUSTOM_HEADERS` do not reach the
-  bridge,
+- the actual `.env` source category Gemini CLI would load was identified without
+  exposing its contents,
+- shell and selected-`.env` proxy presence were checked without logging proxy
+  URLs,
+- Candidate 2 proves a real `GEMINI_API_KEY` cannot be restored from `.env` or
+  reach the bridge,
+- both candidates prove Gemini custom headers cannot be restored from `.env` or
+  reach the bridge,
+- both candidates prove an ambient API-version override cannot be restored from
+  `.env` or alter the local contract capture,
+- `x-gemini-api-privileged-user-id` is absent,
 - the auth candidate that reaches the recorder is recorded for both interactive
   and non-interactive mode,
 - exact request paths are recorded,
@@ -930,8 +1028,10 @@ Completion proof includes:
 - backend-down test,
 - no-secret-log test,
 - no-Google-fallback test,
-- inherited-Gemini-key/custom-header isolation test,
-- ambient-proxy fail-closed test,
+- inherited-and-`.env` Gemini-key/custom-header isolation test,
+- API-version isolation test,
+- usage-statistics installation-ID suppression test,
+- ambient-proxy shell-and-`.env` fail-closed test,
 - wrapper environment-isolation test,
 - hosted `gemini` regression check.
 
@@ -1147,8 +1247,13 @@ Required for Termux:
 - `gemini-local` uses the same installed executable.
 - Model traffic goes to direct loopback first and is not sent through an ambient
   HTTP(S) proxy.
-- No real Google API key is required by local mode or forwarded to the bridge.
-- Inherited Gemini custom request headers do not reach the bridge in V1.
+- No real Google API key is required by local mode, restored by Gemini CLI's
+  `.env` loading, or forwarded to the bridge.
+- Gemini custom request headers cannot be restored from `.env` or reach the
+  bridge in V1.
+- An ambient `GOOGLE_GENAI_API_VERSION` cannot silently change the local
+  protocol capture.
+- `x-gemini-api-privileged-user-id` is absent from local model traffic.
 - Static Gemini response translation works.
 - Static Gemini SSE translation works.
 - llama.cpp text inference works.
@@ -1186,9 +1291,13 @@ These items can be valuable later but do not block the first local agent path.
 - Automatic hardware-based model selection.
 - Model benchmarking and recommendation UI.
 - Provider abstraction patches inside upstream `Gemini CLI`.
+- A separately named Apache-2.0 derivative CLI in another repository if a
+  future architecture review decides source ownership is cleaner than the
+  compatibility bridge. This requires a fresh license, dependency-notice, and
+  trademark/branding review at the exact fork point.
 - A permanent GitHub distribution of this local customization.
-- Proxy-preserving local mode for environments that require HTTP(S) proxy
-  variables while also requiring direct localhost model transport.
+- Proxy-preserving local mode using a reviewed `NO_PROXY`/`no_proxy` loopback
+  exclusion for environments that require ambient HTTP(S) proxy variables.
 
 ## Stop conditions
 
@@ -1200,8 +1309,11 @@ Stop implementation and return to planning if any of these conditions occur.
 - The bridge must receive or persist a real Google credential.
 - Local mode would need to shadow existing native system settings/defaults
   without an accepted preservation/composition strategy.
-- V1 cannot prevent inherited Gemini provider credentials/custom headers from
-  reaching the localhost bridge.
+- V1 cannot prevent inherited or `.env`-restored Gemini provider credentials,
+  custom headers, or API-version overrides from reaching or altering the
+  localhost contract.
+- V1 cannot suppress the stable usage-statistics installation identifier from
+  local model traffic.
 - V1 cannot guarantee direct loopback model traffic without silently breaking a
   required ambient proxy configuration.
 - A required `Gemini CLI` feature depends on an untranslatable private protocol.
@@ -1211,7 +1323,8 @@ Stop implementation and return to planning if any of these conditions occur.
 - Upstream changes invalidate the accepted provider seam before installation.
 
 A stop condition does not authorize a source fork automatically. It requires a
-new architecture review.
+new architecture review. A derivative CLI remains a separately reviewed future
+option, not an automatic fallback.
 
 ## Next steps
 
