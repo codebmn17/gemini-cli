@@ -109,8 +109,8 @@ auth method for a normal (non-`--acp`) invocation:
   `USE_VERTEX_AI`. Any other value, including `GATEWAY`, falls through to
   `return 'Invalid auth method selected.'`, and `gemini.tsx` treats that as a
   fatal authentication error. This validation call is skipped only when
-  `settings.merged.security.auth.useExternal` is `true` — a persisted setting,
-  not an environment variable.
+  `settings.merged.security.auth.useExternal` is `true` — a setting-layer
+  value, not an environment variable.
 - The only in-source call sites that construct and use `AuthType.GATEWAY`
   without going through `validateAuthMethod()` are
   `packages/cli/src/acp/acpSessionManager.ts` and `acpRpcDispatcher.ts`, which
