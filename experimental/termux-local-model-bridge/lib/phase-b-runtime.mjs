@@ -89,25 +89,29 @@ function stringRecordsEqual(actual, expected) {
 }
 
 // Runtime-owned hardening independent of the auth-routing contract's own
-// maskToEmpty list, which governs Gemini/API/proxy-specific keys. These are
-// generic Node-runtime and OS-loader variables that are interpreted *before*
-// any Gemini application code runs -- by Node's own bootstrap (NODE_OPTIONS
-// can `--require` arbitrary code; NODE_PATH alters module resolution) or by
-// the platform dynamic linker (LD_PRELOAD/LD_LIBRARY_PATH on Linux/Android,
-// DYLD_* on Darwin) -- plus HOME/XDG_* base-dir variables that many
-// dependencies consult via raw os.homedir()/XDG lookups independently of
-// Gemini's own GEMINI_CLI_HOME-first paths.ts wrapper, and NODE_EXTRA_CA_CERTS
-// / SSL_CERT_FILE / SSL_CERT_DIR which can redirect TLS trust. None of these
-// are safe to forward into a materialized child environment regardless of
-// what any contract declares, so they are masked here unconditionally as a
-// second, contract-independent layer of defense.
+// maskToEmpty list. These variables are interpreted by Node/the OS before or
+// independently of Gemini application code, or can redirect state and trust
+// outside the isolated runtime. Inherited values are scrubbed unconditionally;
+// HOME/XDG/temp locations are then rebound to runtime-owned paths below.
 export const GENERIC_RUNTIME_MASK_KEYS = Object.freeze([
   'HOME',
+  'NODE_CHANNEL_FD',
+  'NODE_COMPILE_CACHE',
   'NODE_EXTRA_CA_CERTS',
+  'NODE_ICU_DATA',
   'NODE_OPTIONS',
   'NODE_PATH',
+  'NODE_REDIRECT_WARNINGS',
+  'NODE_UNIQUE_ID',
+  'NODE_V8_COVERAGE',
+  'OPENSSL_CONF',
+  'OPENSSL_MODULES',
+  'SSLKEYLOGFILE',
   'SSL_CERT_DIR',
   'SSL_CERT_FILE',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
   'XDG_CACHE_HOME',
   'XDG_CONFIG_HOME',
   'XDG_DATA_HOME',
@@ -302,14 +306,6 @@ function requirePrivateMode(stat, label) {
   }
 }
 
-// Opens the directory itself (O_NOFOLLOW so a trailing symlink fails the
-// open outright, O_DIRECTORY so a non-directory does too) and verifies/chmods
-// via that held descriptor rather than re-touching the path afterward. A
-// path-based chmodSync()-then-lstatSync() pair (the prior implementation)
-// leaves a window between the two calls where the path could be swapped out
-// from under it; fchmodSync/fstatSync on an already-open descriptor cannot be
-// redirected by anything that happens to the path afterward. Mirrors the
-// descriptor-held pattern writePrivateSettings already uses below.
 function verifyPrivateDirectory(directoryPath) {
   const dirFlag = fs.constants.O_DIRECTORY ?? 0;
   const noFollow = fs.constants.O_NOFOLLOW ?? 0;
@@ -394,17 +390,75 @@ function buildChildEnvironment(contract, parentEnv, runtimeBindings) {
   return child;
 }
 
-function removeRuntimeRoot(runtimeRoot) {
+function lstatIfExists(targetPath) {
   try {
-    const stat = fs.lstatSync(runtimeRoot);
-    if (stat.isSymbolicLink()) {
-      fs.unlinkSync(runtimeRoot);
-      return;
-    }
-    fs.rmSync(runtimeRoot, { recursive: true, force: false });
+    return fs.lstatSync(targetPath);
   } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+    if (error?.code === 'ENOENT') return null;
+    throw error;
   }
+}
+
+function requireIssuedPath(targetPath, expectedIdentity, kind, label) {
+  const stat = fs.lstatSync(targetPath);
+  if (stat.isSymbolicLink()) fail(`${label} became a symbolic link before cleanup`);
+  if (kind === 'directory' ? !stat.isDirectory() : !stat.isFile()) {
+    fail(`${label} changed filesystem type before cleanup`);
+  }
+  if (!sameIdentity(stat, expectedIdentity)) {
+    fail(`${label} identity changed before cleanup`);
+  }
+  return stat;
+}
+
+function removeRuntimeRoot(runtimeRoot, expectedIdentity) {
+  const stat = lstatIfExists(runtimeRoot);
+  if (!stat) return;
+  if (stat.isSymbolicLink()) {
+    fs.unlinkSync(runtimeRoot);
+    return;
+  }
+  if (!expectedIdentity) fail('runtime root identity is unavailable for cleanup');
+  if (!stat.isDirectory() || !sameIdentity(stat, expectedIdentity)) {
+    fail('runtime root identity changed before cleanup');
+  }
+  fs.rmSync(runtimeRoot, { recursive: true, force: false });
+}
+
+function removeIssuedRuntimeRoot(metadata) {
+  const rootStat = lstatIfExists(metadata.runtimeRoot);
+  if (!rootStat) return;
+  if (rootStat.isSymbolicLink()) {
+    fs.unlinkSync(metadata.runtimeRoot);
+    return;
+  }
+  if (
+    !rootStat.isDirectory() ||
+    !sameIdentity(rootStat, metadata.identities.runtimeRoot)
+  ) {
+    fail('runtime root identity changed before cleanup');
+  }
+
+  requireIssuedPath(
+    path.join(metadata.runtimeRoot, 'gemini-home'),
+    metadata.identities.geminiHome,
+    'directory',
+    'geminiHome',
+  );
+  requireIssuedPath(
+    path.join(metadata.runtimeRoot, 'cwd'),
+    metadata.identities.workingDirectory,
+    'directory',
+    'workingDirectory',
+  );
+  requireIssuedPath(
+    path.join(metadata.runtimeRoot, 'system-settings.json'),
+    metadata.identities.systemSettingsFile,
+    'file',
+    'systemSettingsFile',
+  );
+
+  fs.rmSync(metadata.runtimeRoot, { recursive: true, force: false });
 }
 
 function requireActiveRuntime(runtime) {
@@ -425,11 +479,13 @@ export function materializePhaseBRuntime({
   const safeTempParent = resolveSafeTempParent(tempParent);
 
   let runtimeRoot;
+  let runtimeRootIdentity;
   let settingsDescriptor;
   let runtime;
   try {
     runtimeRoot = fs.mkdtempSync(path.join(safeTempParent, RUNTIME_PREFIX));
     const runtimeRootStat = verifyPrivateDirectory(runtimeRoot);
+    runtimeRootIdentity = identity(runtimeRootStat);
 
     const geminiHome = path.join(runtimeRoot, 'gemini-home');
     const workingDirectory = path.join(runtimeRoot, 'cwd');
@@ -446,6 +502,15 @@ export function materializePhaseBRuntime({
     const childEnvironment = buildChildEnvironment(contract, parentEnv, {
       GEMINI_CLI_HOME: geminiHome,
       GEMINI_CLI_SYSTEM_SETTINGS_PATH: systemSettingsFile,
+      HOME: geminiHome,
+      XDG_CONFIG_HOME: path.join(geminiHome, '.config'),
+      XDG_DATA_HOME: path.join(geminiHome, '.local', 'share'),
+      XDG_CACHE_HOME: path.join(geminiHome, '.cache'),
+      XDG_STATE_HOME: path.join(geminiHome, '.local', 'state'),
+      XDG_RUNTIME_DIR: runtimeRoot,
+      TMPDIR: runtimeRoot,
+      TMP: runtimeRoot,
+      TEMP: runtimeRoot,
     });
 
     runtime = Object.freeze({
@@ -463,7 +528,7 @@ export function materializePhaseBRuntime({
       settingsDescriptor,
       expectedSettingsText: settingsResult.expectedText,
       identities: {
-        runtimeRoot: identity(runtimeRootStat),
+        runtimeRoot: runtimeRootIdentity,
         geminiHome: identity(geminiHomeStat),
         workingDirectory: identity(workingDirectoryStat),
         systemSettingsFile: identity(settingsResult.stat),
@@ -482,7 +547,7 @@ export function materializePhaseBRuntime({
     }
     if (runtimeRoot) {
       try {
-        removeRuntimeRoot(runtimeRoot);
+        removeRuntimeRoot(runtimeRoot, runtimeRootIdentity);
       } catch {
         // Preserve the original fail-closed error; cleanup is best effort here.
       }
@@ -533,12 +598,24 @@ export function verifyPhaseBRuntime(runtime) {
   ) {
     fail('isolated settings file changed after materialization');
   }
-  if (
-    runtime.childEnvironment.GEMINI_CLI_HOME !== runtime.geminiHome ||
-    runtime.childEnvironment.GEMINI_CLI_SYSTEM_SETTINGS_PATH !==
-      runtime.systemSettingsFile
-  ) {
-    fail('runtime environment bindings no longer match runtime paths');
+
+  const expectedRuntimeBindings = {
+    GEMINI_CLI_HOME: runtime.geminiHome,
+    GEMINI_CLI_SYSTEM_SETTINGS_PATH: runtime.systemSettingsFile,
+    HOME: runtime.geminiHome,
+    XDG_CONFIG_HOME: path.join(runtime.geminiHome, '.config'),
+    XDG_DATA_HOME: path.join(runtime.geminiHome, '.local', 'share'),
+    XDG_CACHE_HOME: path.join(runtime.geminiHome, '.cache'),
+    XDG_STATE_HOME: path.join(runtime.geminiHome, '.local', 'state'),
+    XDG_RUNTIME_DIR: runtime.runtimeRoot,
+    TMPDIR: runtime.runtimeRoot,
+    TMP: runtime.runtimeRoot,
+    TEMP: runtime.runtimeRoot,
+  };
+  for (const [key, expectedValue] of Object.entries(expectedRuntimeBindings)) {
+    if (runtime.childEnvironment[key] !== expectedValue) {
+      fail(`runtime environment binding changed: ${key}`);
+    }
   }
   return true;
 }
@@ -548,17 +625,8 @@ export function cleanupPhaseBRuntime(runtime) {
   try {
     fs.closeSync(metadata.settingsDescriptor);
   } finally {
-    // Nested so the handle is deregistered even if directory removal throws
-    // (e.g. an unremovable entry). Without this, a failed removeRuntimeRoot
-    // left the handle "active": a retry would re-run requireActiveRuntime
-    // successfully and call fs.closeSync again on a descriptor number that
-    // was already closed above -- either a confusing EBADF, or worse, a
-    // silent close of an unrelated descriptor if the OS had since reused
-    // that fd number for something else in this process. Marking the handle
-    // inactive here means a retry instead gets a clean, honest "unknown or
-    // already cleaned" from requireActiveRuntime.
     try {
-      removeRuntimeRoot(metadata.runtimeRoot);
+      removeIssuedRuntimeRoot(metadata);
     } finally {
       ACTIVE_RUNTIMES.delete(runtime);
     }

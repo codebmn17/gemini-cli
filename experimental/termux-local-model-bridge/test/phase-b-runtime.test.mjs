@@ -107,6 +107,11 @@ test('materializes a fresh private runtime with empty cwd and exact isolated set
       fs.readFileSync(runtime.systemSettingsFile, 'utf8'),
     );
     assert.deepEqual(writtenSettings, contract.isolatedSettings);
+    assert.equal(runtime.childEnvironment.HOME, runtime.geminiHome);
+    assert.equal(runtime.childEnvironment.XDG_RUNTIME_DIR, runtime.runtimeRoot);
+    assert.equal(runtime.childEnvironment.TMPDIR, runtime.runtimeRoot);
+    assert.equal(runtime.childEnvironment.TMP, runtime.runtimeRoot);
+    assert.equal(runtime.childEnvironment.TEMP, runtime.runtimeRoot);
     assert.equal(verifyPhaseBRuntime(runtime), true);
 
     if (process.platform !== 'win32') {
@@ -132,6 +137,7 @@ test('default materialization accepts Node process.env rather than requiring a p
     });
     assert.equal(runtime.childEnvironment.GEMINI_API_KEY, LOCAL_PLACEHOLDER_API_KEY);
     assert.equal(runtime.childEnvironment.GEMINI_CLI_HOME, runtime.geminiHome);
+    assert.equal(runtime.childEnvironment.HOME, runtime.geminiHome);
     assert.equal(verifyPhaseBRuntime(runtime), true);
   } finally {
     if (runtime) cleanupPhaseBRuntime(runtime);
@@ -211,7 +217,13 @@ test('integrity recheck rejects cwd contamination and settings-file replacement'
     fs.writeFileSync(runtime.systemSettingsFile, settingsText, { mode: 0o600 });
     assert.throws(() => verifyPhaseBRuntime(runtime));
   } finally {
-    if (runtime) cleanupPhaseBRuntime(runtime);
+    if (runtime) {
+      try {
+        cleanupPhaseBRuntime(runtime);
+      } catch {
+        // Replacement is intentionally unsafe for recursive cleanup.
+      }
+    }
     fs.rmSync(tempParent, { recursive: true, force: true });
   }
 });
@@ -291,21 +303,23 @@ test('runtime source contains filesystem materialization but no process or netwo
   assert.equal(source.includes("from 'node:fs'"), true);
 });
 
-// Node/OS-runtime variables interpreted before any Gemini application code
-// runs: NODE_OPTIONS can `--require` arbitrary code into the process,
-// LD_PRELOAD/DYLD_INSERT_LIBRARIES force a shared library into it, and
-// HOME/XDG_*/NODE_EXTRA_CA_CERTS/SSL_CERT_* redirect config, cache, or TLS
-// trust. None of these are in the auth-routing contract's maskToEmpty list
-// (which only covers Gemini/API/proxy-specific keys), so the runtime module
-// must mask them itself as a second, contract-independent layer -- this is
-// what a real materialized childEnvironment would hand to a future spawn.
-test('masks generic Node/OS runtime-injection variables independently of the contract mask list', () => {
+test('scrubs generic Node/OS injection variables and rebinds generic state inside the private runtime', () => {
   const tempParent = makeTempParent();
   let runtime;
   try {
     const maliciousParentEnv = {
+      NODE_CHANNEL_FD: '9',
+      NODE_COMPILE_CACHE: '/tmp/attacker-compile-cache',
+      NODE_EXTRA_CA_CERTS: '/tmp/attacker-ca.pem',
+      NODE_ICU_DATA: '/tmp/attacker-icu',
       NODE_OPTIONS: '--require /tmp/evil-preload.js',
       NODE_PATH: '/tmp/attacker-node-modules',
+      NODE_REDIRECT_WARNINGS: '/tmp/attacker-warnings.log',
+      NODE_UNIQUE_ID: 'attacker-worker',
+      NODE_V8_COVERAGE: '/tmp/attacker-coverage',
+      OPENSSL_CONF: '/tmp/attacker-openssl.cnf',
+      OPENSSL_MODULES: '/tmp/attacker-openssl-modules',
+      SSLKEYLOGFILE: '/tmp/attacker-keylog',
       LD_PRELOAD: '/tmp/evil.so',
       LD_LIBRARY_PATH: '/tmp/attacker-libs',
       LD_AUDIT: '/tmp/attacker-audit.so',
@@ -318,7 +332,9 @@ test('masks generic Node/OS runtime-injection variables independently of the con
       XDG_CACHE_HOME: '/tmp/attacker-xdg-cache',
       XDG_STATE_HOME: '/tmp/attacker-xdg-state',
       XDG_RUNTIME_DIR: '/tmp/attacker-xdg-runtime',
-      NODE_EXTRA_CA_CERTS: '/tmp/attacker-ca.pem',
+      TMPDIR: '/tmp/attacker-tmpdir',
+      TMP: '/tmp/attacker-tmp',
+      TEMP: '/tmp/attacker-temp',
       SSL_CERT_FILE: '/tmp/attacker-ssl-cert-file.pem',
       SSL_CERT_DIR: '/tmp/attacker-ssl-cert-dir',
       KEEP_ME: 'kept',
@@ -330,10 +346,52 @@ test('masks generic Node/OS runtime-injection variables independently of the con
       tempParent,
     });
 
-    for (const key of Object.keys(maliciousParentEnv)) {
-      if (key === 'KEEP_ME') continue;
+    for (const key of [
+      'NODE_CHANNEL_FD',
+      'NODE_COMPILE_CACHE',
+      'NODE_EXTRA_CA_CERTS',
+      'NODE_ICU_DATA',
+      'NODE_OPTIONS',
+      'NODE_PATH',
+      'NODE_REDIRECT_WARNINGS',
+      'NODE_UNIQUE_ID',
+      'NODE_V8_COVERAGE',
+      'OPENSSL_CONF',
+      'OPENSSL_MODULES',
+      'SSLKEYLOGFILE',
+      'LD_PRELOAD',
+      'LD_LIBRARY_PATH',
+      'LD_AUDIT',
+      'DYLD_INSERT_LIBRARIES',
+      'DYLD_LIBRARY_PATH',
+      'DYLD_FALLBACK_LIBRARY_PATH',
+      'SSL_CERT_FILE',
+      'SSL_CERT_DIR',
+    ]) {
       assert.equal(runtime.childEnvironment[key], '', key);
     }
+
+    assert.equal(runtime.childEnvironment.HOME, runtime.geminiHome);
+    assert.equal(
+      runtime.childEnvironment.XDG_CONFIG_HOME,
+      path.join(runtime.geminiHome, '.config'),
+    );
+    assert.equal(
+      runtime.childEnvironment.XDG_DATA_HOME,
+      path.join(runtime.geminiHome, '.local', 'share'),
+    );
+    assert.equal(
+      runtime.childEnvironment.XDG_CACHE_HOME,
+      path.join(runtime.geminiHome, '.cache'),
+    );
+    assert.equal(
+      runtime.childEnvironment.XDG_STATE_HOME,
+      path.join(runtime.geminiHome, '.local', 'state'),
+    );
+    assert.equal(runtime.childEnvironment.XDG_RUNTIME_DIR, runtime.runtimeRoot);
+    assert.equal(runtime.childEnvironment.TMPDIR, runtime.runtimeRoot);
+    assert.equal(runtime.childEnvironment.TMP, runtime.runtimeRoot);
+    assert.equal(runtime.childEnvironment.TEMP, runtime.runtimeRoot);
     assert.equal(runtime.childEnvironment.KEEP_ME, 'kept');
   } finally {
     if (runtime) cleanupPhaseBRuntime(runtime);
@@ -341,17 +399,30 @@ test('masks generic Node/OS runtime-injection variables independently of the con
   }
 });
 
-test('generic runtime mask keys and prefixes are exported and cover the named injection surfaces', () => {
+test('generic runtime mask keys and prefixes cover the named injection and state-redirection surfaces', () => {
   for (const key of [
     'HOME',
+    'NODE_CHANNEL_FD',
+    'NODE_COMPILE_CACHE',
+    'NODE_EXTRA_CA_CERTS',
+    'NODE_ICU_DATA',
     'NODE_OPTIONS',
     'NODE_PATH',
-    'NODE_EXTRA_CA_CERTS',
+    'NODE_REDIRECT_WARNINGS',
+    'NODE_UNIQUE_ID',
+    'NODE_V8_COVERAGE',
+    'OPENSSL_CONF',
+    'OPENSSL_MODULES',
+    'SSLKEYLOGFILE',
     'SSL_CERT_FILE',
     'SSL_CERT_DIR',
+    'TEMP',
+    'TMP',
+    'TMPDIR',
     'XDG_CONFIG_HOME',
     'XDG_DATA_HOME',
     'XDG_CACHE_HOME',
+    'XDG_RUNTIME_DIR',
     'XDG_STATE_HOME',
   ]) {
     assert.ok(GENERIC_RUNTIME_MASK_KEYS.includes(key), key);
@@ -360,15 +431,7 @@ test('generic runtime mask keys and prefixes are exported and cover the named in
   assert.ok(GENERIC_RUNTIME_MASK_PREFIXES.includes('DYLD_'));
 });
 
-// Directory creation now opens the new directory (O_NOFOLLOW|O_DIRECTORY) and
-// chmods/stats that descriptor rather than the path, closing the window
-// between mkdtempSync/mkdirSync and a path-based chmodSync+lstatSync where
-// the path could be swapped. This test covers the complementary, always-
-// testable half: that a runtime root swapped for a symlink *after*
-// materialization is still caught, extending symlink-attack coverage to the
-// runtime root itself (previously only cwd-contamination and settings-file
-// replacement were covered here).
-test('integrity recheck rejects a runtime root swapped for a symlink after materialization', () => {
+test('integrity recheck rejects a runtime root swapped for a symlink and cleanup only unlinks the replacement', () => {
   const tempParent = makeTempParent();
   let runtime;
   try {
@@ -381,28 +444,81 @@ test('integrity recheck rejects a runtime root swapped for a symlink after mater
 
     const decoy = path.join(tempParent, 'decoy-target');
     fs.mkdirSync(decoy, { mode: 0o700 });
+    fs.writeFileSync(path.join(decoy, 'sentinel.txt'), 'must survive');
     fs.rmSync(runtime.runtimeRoot, { recursive: true, force: true });
     fs.symlinkSync(decoy, runtime.runtimeRoot);
 
     assert.throws(() => verifyPhaseBRuntime(runtime));
-
-    fs.unlinkSync(runtime.runtimeRoot);
-    fs.rmSync(decoy, { recursive: true, force: true });
+    cleanupPhaseBRuntime(runtime);
     runtime = null;
+
+    assert.equal(fs.existsSync(path.join(decoy, 'sentinel.txt')), true);
+    assert.equal(fs.existsSync(path.join(tempParent, 'gemini-local-phase-b-*')), false);
+    fs.rmSync(decoy, { recursive: true, force: true });
   } finally {
     if (runtime) cleanupPhaseBRuntime(runtime);
     fs.rmSync(tempParent, { recursive: true, force: true });
   }
 });
 
-// Reproduces a failed directory removal (via chattr +i, which this sandbox
-// enforces even for root) to prove cleanup no longer leaves the handle
-// "active" after fs.closeSync has already succeeded. Before the fix, a retry
-// found the stale handle still registered and called fs.closeSync again on
-// an already-closed descriptor number -- confusing at best (EBADF) and
-// unsafe at worst (silently closing an unrelated fd if the number had been
-// reused elsewhere in the process). Skips cleanly where chattr/immutable
-// attributes aren't available so this stays portable across CI filesystems.
+test('cleanup refuses a replacement real runtime-root directory and preserves its contents', () => {
+  const tempParent = makeTempParent();
+  let replacementRoot;
+  let originalRoot;
+  try {
+    const runtime = materializePhaseBRuntime({
+      contract: buildContract(),
+      parentEnv: {},
+      tempParent,
+    });
+    replacementRoot = runtime.runtimeRoot;
+    originalRoot = `${runtime.runtimeRoot}-original`;
+    fs.renameSync(runtime.runtimeRoot, originalRoot);
+    fs.mkdirSync(replacementRoot, { mode: 0o700 });
+    const sentinel = path.join(replacementRoot, 'do-not-delete.txt');
+    fs.writeFileSync(sentinel, 'unrelated replacement content');
+
+    assert.throws(
+      () => cleanupPhaseBRuntime(runtime),
+      /runtime root identity changed before cleanup/,
+    );
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'unrelated replacement content');
+    assert.throws(() => cleanupPhaseBRuntime(runtime), /unknown or already cleaned/);
+  } finally {
+    if (replacementRoot) fs.rmSync(replacementRoot, { recursive: true, force: true });
+    if (originalRoot) fs.rmSync(originalRoot, { recursive: true, force: true });
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
+test('cleanup refuses a replacement tracked inner directory and preserves its contents', () => {
+  const tempParent = makeTempParent();
+  let runtimeRoot;
+  try {
+    const runtime = materializePhaseBRuntime({
+      contract: buildContract(),
+      parentEnv: {},
+      tempParent,
+    });
+    runtimeRoot = runtime.runtimeRoot;
+    const originalGeminiHome = `${runtime.geminiHome}-original`;
+    fs.renameSync(runtime.geminiHome, originalGeminiHome);
+    fs.mkdirSync(runtime.geminiHome, { mode: 0o700 });
+    const sentinel = path.join(runtime.geminiHome, 'do-not-delete.txt');
+    fs.writeFileSync(sentinel, 'replacement inner directory');
+
+    assert.throws(
+      () => cleanupPhaseBRuntime(runtime),
+      /geminiHome identity changed before cleanup/,
+    );
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'replacement inner directory');
+    assert.throws(() => cleanupPhaseBRuntime(runtime), /unknown or already cleaned/);
+  } finally {
+    if (runtimeRoot) fs.rmSync(runtimeRoot, { recursive: true, force: true });
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+});
+
 test('a failed cleanup still deregisters the handle so a retry fails cleanly instead of double-closing', (t) => {
   if (process.platform !== 'linux') {
     t.skip('chattr immutable-attribute test is Linux-specific');
