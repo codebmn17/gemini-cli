@@ -155,12 +155,23 @@ export function stripJsonComments(input) {
   return output;
 }
 
+function isRegularFile(filePath, fsApi = fs) {
+  try {
+    return fsApi.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function readJsonObject(filePath, fsApi = fs) {
   if (!fsApi.existsSync(filePath)) {
     return { status: 'absent', value: {} };
   }
 
   try {
+    if (!isRegularFile(filePath, fsApi)) {
+      return { status: 'invalid', value: {} };
+    }
     const parsed = JSON.parse(stripJsonComments(fsApi.readFileSync(filePath, 'utf8')));
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       return { status: 'invalid', value: {} };
@@ -316,14 +327,33 @@ export function resolveWorkspaceTrust({
   }
 
   // Gemini can receive IDE trust through an in-memory store. A standalone
-  // preflight cannot read that store, so fail closed when an IDE-server context
-  // is present instead of guessing.
+  // preflight cannot read that store, so fail closed whenever IDE trust may be
+  // active instead of guessing. Preserve Gemini's trust precedence above: an
+  // explicit trust override or disabled folder trust already determines trust.
   if (hasOwn(environment, 'GEMINI_CLI_IDE_SERVER_PORT')) {
     return {
       status: 'blocked',
       isTrusted: false,
       source: 'ide-undetermined',
       blocker: 'ide-trust-context-undetermined',
+    };
+  }
+
+  const ideMode = readBooleanSetting(userSettings, ['ide', 'enabled'], false);
+  if (ideMode.status === 'invalid') {
+    return {
+      status: 'blocked',
+      isTrusted: false,
+      source: 'settings-invalid',
+      blocker: 'ide-mode-setting-invalid',
+    };
+  }
+  if (ideMode.value) {
+    return {
+      status: 'blocked',
+      isTrusted: false,
+      source: 'ide-undetermined',
+      blocker: 'ide-mode-enabled-in-settings',
     };
   }
 
@@ -473,6 +503,13 @@ function selectedEnvPresence(filePath, fsApi = fs) {
   }
 
   try {
+    if (!isRegularFile(filePath, fsApi)) {
+      return {
+        status: 'invalid',
+        sensitive: presenceMap({}, SENSITIVE_ENV_KEYS),
+        proxy: presenceMap({}, PROXY_ENV_KEYS),
+      };
+    }
     const keys = scanDotenvKeys(fsApi.readFileSync(filePath, 'utf8'));
     const keyObject = Object.fromEntries([...keys].map((key) => [key, true]));
     return {
