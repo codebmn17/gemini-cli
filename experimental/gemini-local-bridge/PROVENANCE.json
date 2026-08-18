@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "bundleName": "gemini-local-bridge-promotion",
   "promotedFromRepo": "codebmn17/gemini-cli",
   "promotedFromCommit": "e9c5ad7f382be3144daf71b7f477db1a183955da",
@@ -9,7 +9,7 @@
     "version": "0.55.1",
     "commit": "41327e407da58aa01c409ef6685b7b5d379f295e"
   },
-  "generatedAt": "2026-08-18T02:36:07.655Z",
+  "generatedAt": "2026-08-18T03:04:59.129Z",
   "generatedBy": "host-side automated promotion script (Linux); not a Termux/device build",
   "note": "Files listed here are byte-for-byte copies of the accepted PR review head. test/ files from the review stack are intentionally excluded from the installable payload (dev/CI-only, not required at runtime).",
   "files": [
@@ -17,6 +17,7 @@
       "originalPath": "experimental/termux-local-model-bridge/bin/phase-b-auth-routing.mjs",
       "bundlePath": "vendor/phase-b/bin/phase-b-auth-routing.mjs",
       "mode": "100755",
+      "installedMode": "0555",
       "gitBlobSha": "d086818f3e397ec152a868499d0d72c3a75fbb7f",
       "sha256": "26555c4d99a8ee7118b5416a8df6d1862d4ae7aaaadfec7041cc44ca78b28e64",
       "bytes": 2262
@@ -25,6 +26,7 @@
       "originalPath": "experimental/termux-local-model-bridge/bin/phase-b-launch-probe.mjs",
       "bundlePath": "vendor/phase-b/bin/phase-b-launch-probe.mjs",
       "mode": "100755",
+      "installedMode": "0555",
       "gitBlobSha": "86a383bc8582f26529df26e7bbc020e6135820eb",
       "sha256": "77096f3a4d9bcfae0e67c52e11b27bf8eaa0fd7ead82ea8ac4603c49e60598dd",
       "bytes": 2094
@@ -33,6 +35,7 @@
       "originalPath": "experimental/termux-local-model-bridge/bin/phase-b-preflight.mjs",
       "bundlePath": "vendor/phase-b/bin/phase-b-preflight.mjs",
       "mode": "100755",
+      "installedMode": "0555",
       "gitBlobSha": "e82e92c1e5f036aec79fc5a0034e53486451a544",
       "sha256": "08b9181188427df150fb0ad78cb74d7c1c21fb42494ae6f0230fe26216799acc",
       "bytes": 904
@@ -41,6 +44,7 @@
       "originalPath": "experimental/termux-local-model-bridge/bin/phase-b-recorder.mjs",
       "bundlePath": "vendor/phase-b/bin/phase-b-recorder.mjs",
       "mode": "100755",
+      "installedMode": "0555",
       "gitBlobSha": "e753d7f80490eb9c20fdddb31ecf58936652ce19",
       "sha256": "00f7d6a0b4fb7f70852ba32c5db016a4cc222d02fe26d3e4015a0c2c55c34c23",
       "bytes": 2878
@@ -49,6 +53,7 @@
       "originalPath": "experimental/termux-local-model-bridge/lib/phase-b-auth-routing.mjs",
       "bundlePath": "vendor/phase-b/lib/phase-b-auth-routing.mjs",
       "mode": "100644",
+      "installedMode": "0444",
       "gitBlobSha": "b6ff3c1ce821b074e7ad910ccc3c4a4f1c9c7c75",
       "sha256": "cc89a5d1f01b74a42b97efa08d95c7630776c563cefd07b276fbeb0f6673a282",
       "bytes": 10089
@@ -57,6 +62,7 @@
       "originalPath": "experimental/termux-local-model-bridge/lib/phase-b-launch-probe.mjs",
       "bundlePath": "vendor/phase-b/lib/phase-b-launch-probe.mjs",
       "mode": "100644",
+      "installedMode": "0444",
       "gitBlobSha": "b6d0b110aca7275223bc9b83c17388c95fa25708",
       "sha256": "d3e91f3e1f4660f255c2de4b2bc1eaaef32eb8181b53ad71c36588344332ceb6",
       "bytes": 20174
@@ -65,6 +71,7 @@
       "originalPath": "experimental/termux-local-model-bridge/lib/phase-b-preflight.mjs",
       "bundlePath": "vendor/phase-b/lib/phase-b-preflight.mjs",
       "mode": "100644",
+      "installedMode": "0444",
       "gitBlobSha": "09d12ec08d78b2982954e1c66e3ae47632d4e51a",
       "sha256": "e2c531c7cf69842b5dd852f179ddc019ec54cbd2c297fff1b8074d315cf989e1",
       "bytes": 23159
@@ -73,6 +80,7 @@
       "originalPath": "experimental/termux-local-model-bridge/lib/phase-b-recorder.mjs",
       "bundlePath": "vendor/phase-b/lib/phase-b-recorder.mjs",
       "mode": "100644",
+      "installedMode": "0444",
       "gitBlobSha": "195c79b0b53eab0b55070d1b24ebad4fb29828b5",
       "sha256": "0f41f6d54bb0cdeaa1cdd98199e95cb51ff027b6753ee51eda3d31653b277084",
       "bytes": 5788
@@ -81,6 +89,7 @@
       "originalPath": "experimental/termux-local-model-bridge/lib/phase-b-runtime.mjs",
       "bundlePath": "vendor/phase-b/lib/phase-b-runtime.mjs",
       "mode": "100644",
+      "installedMode": "0444",
       "gitBlobSha": "009ae69e2ddb372ce5bcad0ea1f2cc1adf6e779e",
       "sha256": "76784db120077380ec904a1c3f04e4332a65f04a67965d694cd709932ea19ae6",
       "bytes": 20939
@@ -89,6 +98,7 @@
       "originalPath": "experimental/termux-local-model-bridge/package.json",
       "bundlePath": "vendor/phase-b/package.json",
       "mode": "100644",
+      "installedMode": "0444",
       "gitBlobSha": "4f1ef11da8417d5be3906f63456e217a65772c54",
       "sha256": "bd1595f0bb2d52d9f8caba6a57bcdd06c4b9f4eea40ee79e56897a2c99af4794",
       "bytes": 138

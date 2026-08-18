@@ -1,6 +1,4 @@
 /**
- * @license
- * Copyright 2026 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -38,9 +36,10 @@ function stringIO() {
 }
 
 // Installs the bundle's real payload into `home` by directly copying files
-// (mirrors what install-gemini-local.sh does), without shelling out, so
-// pure-JS tests stay fast; the shell installer itself is exercised
-// end-to-end in test/install.test.mjs.
+// (mirrors what install-gemini-local.sh does, including applying each
+// vendored file's PROVENANCE.json-recorded installedMode), without
+// shelling out to the installer, so pure-JS tests stay fast; the shell
+// installer itself is exercised end-to-end in test/install.test.mjs.
 function stageRealPayload(home) {
   const dataDir = path.join(home, '.local', 'share', 'gemini-local-bridge');
   const configDir = path.join(home, '.config', 'gemini-local-bridge');
@@ -53,6 +52,11 @@ function stageRealPayload(home) {
   execFileSync('cp', [path.join(bundleRoot, 'PROVENANCE.json'), path.join(dataDir, 'PROVENANCE.json')]);
   execFileSync('cp', [path.join(bundleRoot, 'bin', 'gemini-local'), path.join(binDir, 'gemini-local')]);
   chmodSync(path.join(binDir, 'gemini-local'), 0o755);
+
+  const manifest = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+  for (const file of manifest.files) {
+    chmodSync(path.join(dataDir, file.bundlePath), parseInt(file.installedMode, 8));
+  }
   return { dataDir, configDir, binDir };
 }
 
@@ -102,14 +106,19 @@ test('verifyProvenance passes for an untampered install', () => {
   }
 });
 
-test('verifyProvenance detects a tampered vendored file', () => {
+test('verifyProvenance detects a same-size content tamper as hash-mismatch (isolated from size/mode)', () => {
   const home = makeTempHome();
   try {
     const { dataDir } = stageRealPayload(home);
     const target = path.join(dataDir, 'vendor', 'phase-b', 'lib', 'phase-b-launch-probe.mjs');
     const before = sha256File(target);
+    const buffer = readFileSync(target);
+    // Flip one byte in place: same length (no size-mismatch), same mode
+    // (restored below), only the content hash changes.
+    buffer[0] = buffer[0] ^ 0xff;
     chmodSync(target, 0o644);
-    writeFileSync(target, readFileSync(target, 'utf8') + '\n// tampered\n');
+    writeFileSync(target, buffer);
+    chmodSync(target, 0o444);
     const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
     const result = verifyProvenance(dataDir, provenance);
     assert.equal(result.allOk, false);
@@ -117,6 +126,153 @@ test('verifyProvenance detects a tampered vendored file', () => {
     assert.equal(failure.status, 'hash-mismatch');
     assert.equal(failure.expected, before);
     assert.notEqual(failure.actual, before);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance detects an appended-content tamper as size-mismatch', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const target = path.join(dataDir, 'vendor', 'phase-b', 'lib', 'phase-b-launch-probe.mjs');
+    const originalSize = readFileSync(target).length;
+    chmodSync(target, 0o644);
+    writeFileSync(target, readFileSync(target, 'utf8') + '\n// tampered\n');
+    chmodSync(target, 0o444);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    const failure = result.results.find((r) => r.bundlePath === 'vendor/phase-b/lib/phase-b-launch-probe.mjs');
+    assert.equal(failure.status, 'size-mismatch');
+    assert.equal(failure.expected, originalSize);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance detects a mode-mismatch even when content is untouched', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const target = path.join(dataDir, 'vendor', 'phase-b', 'bin', 'phase-b-launch-probe.mjs');
+    chmodSync(target, 0o644); // accepted mode is 100755 -> installedMode 0555; this is wrong
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    const failure = result.results.find((r) => r.bundlePath === 'vendor/phase-b/bin/phase-b-launch-probe.mjs');
+    assert.equal(failure.status, 'mode-mismatch');
+    assert.equal(failure.expected, '0555');
+    assert.equal(failure.actual, '0644');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance rejects a bundlePath that escapes vendor/phase-b/ via ../ without touching the filesystem', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    provenance.files[0] = { ...provenance.files[0], bundlePath: '../../../etc/passwd' };
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    const failure = result.results.find((r) => r.bundlePath === '../../../etc/passwd');
+    assert.equal(failure.status, 'unsafe-path');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance rejects an absolute bundlePath', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    provenance.files[0] = { ...provenance.files[0], bundlePath: '/etc/passwd' };
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    assert.equal(result.results.find((r) => r.bundlePath === '/etc/passwd').status, 'unsafe-path');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance rejects a duplicate bundlePath entry', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    provenance.files.push({ ...provenance.files[0] });
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    assert.equal(result.fileSet.ok, false);
+    assert.deepEqual(result.fileSet.duplicates, [provenance.files[0].bundlePath]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance rejects a manifest missing an expected file', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    const removed = provenance.files.pop();
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    assert.equal(result.fileSet.ok, false);
+    assert.ok(result.fileSet.missing.includes(removed.bundlePath));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance rejects a manifest with an extra, unexpected file entry', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    provenance.files.push({
+      ...provenance.files[0],
+      bundlePath: 'vendor/phase-b/lib/not-a-real-promoted-file.mjs',
+    });
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    assert.equal(result.fileSet.ok, false);
+    assert.ok(result.fileSet.extra.includes('vendor/phase-b/lib/not-a-real-promoted-file.mjs'));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance rejects a manifest with the wrong promoted commit', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    provenance.promotedFromCommit = '0000000000000000000000000000000000000000';
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    assert.equal(result.identity.ok, false);
+    assert.ok(result.identity.mismatches.some((m) => m.field === 'promotedFromCommit'));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('verifyProvenance rejects a manifest with the wrong pinned Gemini identity', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const provenance = JSON.parse(readFileSync(path.join(dataDir, 'PROVENANCE.json'), 'utf8'));
+    provenance.pinnedGeminiCli = { version: '9.9.9', commit: 'deadbeef' };
+    const result = verifyProvenance(dataDir, provenance);
+    assert.equal(result.allOk, false);
+    assert.equal(result.identity.ok, false);
+    const fields = result.identity.mismatches.map((m) => m.field);
+    assert.ok(fields.includes('pinnedGeminiCli.version'));
+    assert.ok(fields.includes('pinnedGeminiCli.commit'));
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -139,19 +295,60 @@ test('verifyProvenance reports a missing file as missing, not a crash', () => {
 
 // --- doctor.mjs ----------------------------------------------------------
 
-test('doctor on a completely uninstalled HOME reports structural failures and NOT READY, exits cleanly', () => {
+test('doctor on a completely uninstalled HOME reports not-installed (not a structural failure)', () => {
   const home = makeTempHome();
   try {
     const report = runDoctor({ HOME: home });
     assert.equal(report.localInferenceReady, false);
+    assert.equal(report.installState, 'not-installed');
+    // Nothing has been installed yet — this is a normal pre-install state,
+    // not corruption, so it must not be reported as a structural failure.
+    assert.equal(report.structuralFailure, false);
     assert.equal(report.checks.find((c) => c.name === 'data-dir-exists').ok, false);
     // Adapter-absence must not itself read as a failed check (it's expected).
     const adapterCheck = report.checks.find((c) => c.name === 'llama-cpp-adapter-installed');
     assert.equal(adapterCheck.ok, true);
     assert.equal(adapterCheck.installed, false);
-    assert.match(formatDoctorReport(report), /NOT READY/);
+    assert.match(formatDoctorReport(report), /NOT INSTALLED/);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('doctor on a corrupt install (tampered payload) reports structuralFailure=true', () => {
+  const home = makeTempHome();
+  try {
+    const { dataDir } = stageRealPayload(home);
+    const target = path.join(dataDir, 'vendor', 'phase-b', 'lib', 'phase-b-recorder.mjs');
+    chmodSync(target, 0o644);
+    writeFileSync(target, readFileSync(target, 'utf8') + '\n// tampered\n');
+    chmodSync(target, 0o444);
+    const report = runDoctor({ HOME: home });
+    assert.equal(report.installState, 'installed-corrupt');
+    assert.equal(report.structuralFailure, true);
+    assert.match(formatDoctorReport(report), /STRUCTURAL FAILURE/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('cli main(): doctor exits 0 for a healthy skeleton (adapter absent) but non-zero for a corrupt install', async () => {
+  const healthyHome = makeTempHome();
+  const corruptHome = makeTempHome();
+  try {
+    stageRealPayload(healthyHome);
+    const s1 = stringIO();
+    const healthyCode = await main(['doctor'], { HOME: healthyHome }, s1.io);
+    assert.equal(healthyCode, 0);
+
+    const { dataDir } = stageRealPayload(corruptHome);
+    rmSync(path.join(dataDir, 'vendor', 'phase-b', 'lib', 'phase-b-recorder.mjs'));
+    const s2 = stringIO();
+    const corruptCode = await main(['doctor'], { HOME: corruptHome }, s2.io);
+    assert.notEqual(corruptCode, 0);
+  } finally {
+    rmSync(healthyHome, { recursive: true, force: true });
+    rmSync(corruptHome, { recursive: true, force: true });
   }
 });
 

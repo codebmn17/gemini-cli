@@ -17,16 +17,24 @@ import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  SCHEMA_VERSION,
+  EXPECTED_PROMOTED_COMMIT,
+  EXPECTED_PINNED_GEMINI_VERSION,
+  EXPECTED_PINNED_GEMINI_COMMIT,
+  EXPECTED_VENDOR_FILES,
+  installedModeForGitMode,
+} from '../lib/provenance-schema.mjs';
 
 const bundleRoot = path.resolve(fileURLToPath(import.meta.url), '..', '..');
 const vendorRoot = path.join(bundleRoot, 'vendor', 'phase-b');
 
 const PROMOTED_FROM_REPO = 'codebmn17/gemini-cli';
-const PROMOTED_FROM_COMMIT = 'e9c5ad7f382be3144daf71b7f477db1a183955da';
+const PROMOTED_FROM_COMMIT = EXPECTED_PROMOTED_COMMIT;
 const PROMOTED_FROM_BRANCH = 'review/termux-local-model-launch-probe-v1';
 const PROMOTED_FROM_ORIGINAL_ROOT = 'experimental/termux-local-model-bridge';
-const PINNED_GEMINI_CLI_VERSION = '0.55.1';
-const PINNED_GEMINI_CLI_COMMIT = '41327e407da58aa01c409ef6685b7b5d379f295e';
+const PINNED_GEMINI_CLI_VERSION = EXPECTED_PINNED_GEMINI_VERSION;
+const PINNED_GEMINI_CLI_COMMIT = EXPECTED_PINNED_GEMINI_COMMIT;
 
 function sha256Of(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
@@ -58,18 +66,33 @@ const files = walk(vendorRoot)
     const bundlePath = path.relative(bundleRoot, absPath).split(path.sep).join('/');
     const relFromVendorRoot = path.relative(vendorRoot, absPath).split(path.sep).join('/');
     const mode = statSync(absPath).mode & 0o777;
+    const gitMode = mode === 0o755 ? '100755' : '100644';
     return {
       originalPath: `${PROMOTED_FROM_ORIGINAL_ROOT}/${relFromVendorRoot}`,
       bundlePath,
-      mode: mode === 0o755 ? '100755' : '100644',
+      mode: gitMode,
+      installedMode: installedModeForGitMode(gitMode),
       gitBlobSha: gitBlobShaOf(buffer),
       sha256: sha256Of(buffer),
       bytes: buffer.length,
     };
   });
 
+const actualPaths = files.map((f) => f.bundlePath).sort();
+const expectedPaths = [...EXPECTED_VENDOR_FILES].sort();
+if (JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)) {
+  process.stderr.write(
+    'generate-provenance: vendor/phase-b/ on disk does not match ' +
+      'lib/provenance-schema.mjs EXPECTED_VENDOR_FILES.\n' +
+      `  on disk: ${JSON.stringify(actualPaths)}\n` +
+      `  expected: ${JSON.stringify(expectedPaths)}\n` +
+      'Update EXPECTED_VENDOR_FILES (a deliberate promotion-set change) or fix vendor/phase-b/.\n',
+  );
+  process.exit(1);
+}
+
 const manifest = {
-  schemaVersion: 1,
+  schemaVersion: SCHEMA_VERSION,
   bundleName: 'gemini-local-bridge-promotion',
   promotedFromRepo: PROMOTED_FROM_REPO,
   promotedFromCommit: PROMOTED_FROM_COMMIT,

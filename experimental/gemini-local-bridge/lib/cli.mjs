@@ -1,6 +1,4 @@
 /**
- * @license
- * Copyright 2026 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -8,6 +6,10 @@ import { runDoctor, formatDoctorReport } from './doctor.mjs';
 import { attemptRun } from './run.mjs';
 
 export const GEMINI_LOCAL_BRIDGE_VERSION = '0.1.0-skeleton';
+
+// Distinct from FAIL_CLOSED_EXIT_CODE (run.mjs) so a shell can tell "no
+// local backend yet" apart from "the installed package itself is broken".
+export const DOCTOR_STRUCTURAL_FAILURE_EXIT_CODE = 4;
 
 const DOCTOR_COMMANDS = new Set(['doctor', '--doctor', 'status', '--status']);
 const VERSION_COMMANDS = new Set(['version', '--version', '-v']);
@@ -41,9 +43,13 @@ export async function main(argv, env = process.env, io = { stdout: process.stdou
   if (DOCTOR_COMMANDS.has(command)) {
     const report = runDoctor(env);
     io.stdout.write((wantsJson ? JSON.stringify(report, null, 2) : formatDoctorReport(report)) + '\n');
-    // Exit code reflects "did diagnostics run", not "is local inference
-    // ready" — readiness is reported in the output, not the exit code.
-    return 0;
+    // Exit code reflects "is the installed package structurally sound",
+    // not "is local inference ready" — the llama.cpp adapter being absent
+    // is an expected skeleton-stage state and still exits 0. A corrupt or
+    // unsafe installation (missing/extra/duplicate promoted file, identity
+    // mismatch, hash/mode/size mismatch, unsafe path) exits non-zero so a
+    // calling shell script can distinguish "not ready yet" from "broken".
+    return report.structuralFailure ? DOCTOR_STRUCTURAL_FAILURE_EXIT_CODE : 0;
   }
 
   if (VERSION_COMMANDS.has(command)) {

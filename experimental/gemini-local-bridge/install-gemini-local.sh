@@ -23,6 +23,36 @@
 
 set -euo pipefail
 
+# Fails closed (exit 3) if $1 exists as a symlink (checked first, via -L,
+# which never follows the link — this also catches a *broken* symlink,
+# which plain -e would treat as "absent") or as anything other than the
+# expected type ($2: "dir" or "file"). Never proceeds through a symlink or
+# an unexpected object and calls that "staying inside the intended
+# location" — an existing symlink or wrong-typed object at one of this
+# installer's critical target paths must be resolved by the user, not
+# silently followed or overwritten. A path that is simply absent, or that
+# already matches the expected type (the normal reinstall-over-a-prior-
+# install case), passes through untouched.
+require_safe_target() {
+  local target="$1"
+  local expected_type="$2"
+  if [ -L "${target}" ]; then
+    echo "install-gemini-local: refusing to proceed — ${target} exists as a symlink" \
+      "(-> $(readlink "${target}" 2>/dev/null || echo '?')). Remove or replace it manually, then re-run." >&2
+    exit 3
+  fi
+  if [ -e "${target}" ]; then
+    if [ "${expected_type}" = "dir" ] && [ ! -d "${target}" ]; then
+      echo "install-gemini-local: refusing to proceed — ${target} exists but is not a directory." >&2
+      exit 3
+    fi
+    if [ "${expected_type}" = "file" ] && [ ! -f "${target}" ]; then
+      echo "install-gemini-local: refusing to proceed — ${target} exists but is not a regular file." >&2
+      exit 3
+    fi
+  fi
+}
+
 if [ -z "${HOME:-}" ]; then
   echo "install-gemini-local: HOME is not set; refusing to guess an install location." >&2
   exit 2
@@ -41,6 +71,11 @@ LAUNCHER_PATH="${BIN_DIR}/gemini-local"
 
 echo "install-gemini-local: installing for HOME=${HOME}"
 
+require_safe_target "${BIN_DIR}" dir
+require_safe_target "${DATA_DIR}" dir
+require_safe_target "${CONFIG_DIR}" dir
+require_safe_target "${LAUNCHER_PATH}" file
+
 mkdir -p "${BIN_DIR}" "${DATA_DIR}" "${CONFIG_DIR}"
 
 # Replace the promoted payload atomically-ish: stage into a temp dir next to
@@ -53,18 +88,44 @@ cp -R "${SCRIPT_DIR}/lib" "${STAGE_DIR}/lib"
 cp -R "${SCRIPT_DIR}/vendor" "${STAGE_DIR}/vendor"
 cp "${SCRIPT_DIR}/PROVENANCE.json" "${STAGE_DIR}/PROVENANCE.json"
 
-# Mark the promoted (vendored) artifacts read-only: they are meant to be
-# immutable between promotions, verified by `gemini-local doctor` against
-# PROVENANCE.json's recorded SHA-256 hashes.
-find "${STAGE_DIR}/vendor" -type f -exec chmod 444 {} +
+# Mark the promoted (vendored) artifacts read-only, per-file, using each
+# file's PROVENANCE.json-recorded installedMode — this preserves the
+# accepted commit's executable-bit distinction (bin/*.mjs launchers stay
+# 0555; lib/*.mjs and package.json become 0444) instead of collapsing
+# everything to one blanket mode, which would silently strip the accepted
+# executable bit from the bin/ launchers.
+"${GEMINI_LOCAL_NODE:-node}" -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const stageDir = process.argv[1];
+const manifest = JSON.parse(fs.readFileSync(path.join(stageDir, "PROVENANCE.json"), "utf8"));
+if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
+  throw new Error("PROVENANCE.json has no files[] entries");
+}
+for (const file of manifest.files) {
+  if (typeof file.installedMode !== "string" || !/^0[0-7]{3}$/.test(file.installedMode)) {
+    throw new Error(`missing/invalid installedMode for ${file.bundlePath}`);
+  }
+  const target = path.join(stageDir, file.bundlePath);
+  fs.chmodSync(target, parseInt(file.installedMode, 8));
+}
+' "${STAGE_DIR}"
 find "${STAGE_DIR}/vendor" -type d -exec chmod 555 {} +
 chmod 444 "${STAGE_DIR}/PROVENANCE.json"
 
+# Re-check immediately before the destructive replace: narrows (does not
+# eliminate — see docs/TERMUX.md and the packaging-hardening report for the
+# acknowledged same-user TOCTOU limitation) the window between the earlier
+# check and this write.
+require_safe_target "${DATA_DIR}/lib" dir
+require_safe_target "${DATA_DIR}/vendor" dir
+require_safe_target "${DATA_DIR}/PROVENANCE.json" file
 rm -rf "${DATA_DIR}/lib" "${DATA_DIR}/vendor" "${DATA_DIR}/PROVENANCE.json"
 mv "${STAGE_DIR}/lib" "${DATA_DIR}/lib"
 mv "${STAGE_DIR}/vendor" "${DATA_DIR}/vendor"
 mv "${STAGE_DIR}/PROVENANCE.json" "${DATA_DIR}/PROVENANCE.json"
 
+require_safe_target "${LAUNCHER_PATH}" file
 cp "${SCRIPT_DIR}/bin/gemini-local" "${LAUNCHER_PATH}"
 chmod 755 "${LAUNCHER_PATH}"
 

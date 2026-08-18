@@ -6,18 +6,43 @@ below). Nothing in this document has been executed on an actual Termux /
 Android device. Run these exact commands on-device and report back what
 actually happens — do not treat this document as proof that it works there.
 
-## 1. Prerequisites
+## 1. Read-only environment inspection (do this first, before anything else)
+
+Run exactly this. It only reads state — it installs, updates, or upgrades
+nothing, and changes nothing about the device:
 
 ```sh
-pkg update -y
-pkg install -y git nodejs
-node --version   # confirm Node is present; note the version in your report
+uname -a
+printf 'HOME=%s\n' "$HOME"
+printf 'PREFIX=%s\n' "$PREFIX"
+command -v git || true
+git --version 2>/dev/null || true
+command -v node || true
+node --version 2>/dev/null || true
+command -v npm || true
+npm --version 2>/dev/null || true
+command -v gemini || true
+gemini --version 2>/dev/null || true
+command -v llama-server || true
+command -v llama-cli || true
+command -v ollama || true
 ```
 
-`gemini-local` is a skeleton at this stage and does not require Termux's
-`nodejs-lts` specifically — any Termux `nodejs` package providing
-`node --test` support (Node 18+) is expected to work, but this has not been
-verified on-device.
+Record the full output. **Do not run `pkg update` / `pkg install` (or any
+other install/upgrade command) as part of this validation pass.** This
+report is meant to establish what is already on the device before any
+change to it is even considered.
+
+If `git`, `node`, or `npm` needed for the next steps is missing: **stop
+here** and report exactly which prerequisite is missing. Installing it is a
+separate, explicitly authorized step, not something to do automatically as
+part of running this validation. Do not install anything just to make
+validation proceed, and do not change a device that was already in a known
+working state merely to run this check.
+
+Only continue to step 2 once you have confirmed `git` and `node` (with
+`node --test` support, i.e. Node 18+) are already present, or their
+installation has been separately authorized and completed.
 
 ## 2. Get this bundle onto the device
 

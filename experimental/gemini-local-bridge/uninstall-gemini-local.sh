@@ -16,6 +16,32 @@
 
 set -euo pipefail
 
+# See install-gemini-local.sh for the full rationale: fails closed (exit 3)
+# if $1 exists as a symlink (checked first, via -L — this also catches a
+# *broken* symlink, which plain -e/-d would treat as "absent") or as
+# anything other than the expected type. Never removes through a symlink
+# or an unexpected object and calls that "staying inside the intended
+# location".
+require_safe_target() {
+  local target="$1"
+  local expected_type="$2"
+  if [ -L "${target}" ]; then
+    echo "uninstall-gemini-local: refusing to proceed — ${target} exists as a symlink" \
+      "(-> $(readlink "${target}" 2>/dev/null || echo '?')). Remove or replace it manually, then re-run." >&2
+    exit 3
+  fi
+  if [ -e "${target}" ]; then
+    if [ "${expected_type}" = "dir" ] && [ ! -d "${target}" ]; then
+      echo "uninstall-gemini-local: refusing to proceed — ${target} exists but is not a directory." >&2
+      exit 3
+    fi
+    if [ "${expected_type}" = "file" ] && [ ! -f "${target}" ]; then
+      echo "uninstall-gemini-local: refusing to proceed — ${target} exists but is not a regular file." >&2
+      exit 3
+    fi
+  fi
+}
+
 PURGE=0
 for arg in "$@"; do
   case "${arg}" in
@@ -41,6 +67,7 @@ DATA_DIR="${HOME}/.local/share/gemini-local-bridge"
 CONFIG_DIR="${HOME}/.config/gemini-local-bridge"
 LAUNCHER_PATH="${BIN_DIR}/gemini-local"
 
+require_safe_target "${LAUNCHER_PATH}" file
 if [ -e "${LAUNCHER_PATH}" ]; then
   rm -f "${LAUNCHER_PATH}"
   echo "uninstall-gemini-local: removed ${LAUNCHER_PATH}"
@@ -48,6 +75,7 @@ else
   echo "uninstall-gemini-local: ${LAUNCHER_PATH} not present, skipping"
 fi
 
+require_safe_target "${DATA_DIR}" dir
 if [ -d "${DATA_DIR}" ]; then
   # Vendored files were installed read-only; chmod back so rm can remove them.
   find "${DATA_DIR}" -type f -exec chmod u+w {} + 2>/dev/null || true
@@ -59,6 +87,7 @@ else
 fi
 
 if [ "${PURGE}" -eq 1 ]; then
+  require_safe_target "${CONFIG_DIR}" dir
   if [ -d "${CONFIG_DIR}" ]; then
     rm -rf "${CONFIG_DIR}"
     echo "uninstall-gemini-local: removed ${CONFIG_DIR} (--purge)"
