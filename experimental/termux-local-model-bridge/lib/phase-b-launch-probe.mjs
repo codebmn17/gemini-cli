@@ -16,6 +16,7 @@ import {
 } from './phase-b-runtime.mjs';
 import {
   CONTROL_ENV_KEYS,
+  GEMINI_DIR,
   PROXY_ENV_KEYS,
   SENSITIVE_ENV_KEYS,
   presenceMap,
@@ -79,16 +80,15 @@ function requireTimeoutMs(value) {
   return value;
 }
 
-// A preflight report only proves the environment it was generated from was
-// safe; it says nothing about the environment the launch actually runs in
-// unless the two are the same snapshot. Reusing phase-b-preflight.mjs's own
-// exported key lists and presenceMap() (not duplicating them, so this can't
-// silently drift from what the preflight itself checks) to require that every
-// sensitive/proxy/control variable's *presence* is unchanged between the two.
-// This is intentionally a presence check, not a value check: the preflight
-// report itself never carries the actual values (only booleans), so this
-// cannot compare or leak values either, and it stays a narrow, bounded
-// addition rather than a general environment-attestation system.
+// A preflight report only proves the tracked environment-presence profile it
+// was generated from was safe. Reusing phase-b-preflight.mjs's own exported
+// key lists and presenceMap() (not duplicating them, so this can't silently
+// drift from what the preflight itself checks) requires that every tracked
+// sensitive/proxy/control variable's *presence* is unchanged at launch time.
+// This deliberately does not establish value identity: the preflight report
+// carries booleans only, never raw values, so the check cannot compare or leak
+// values and stays a narrow guard rather than a general environment-attestation
+// system.
 function requireConsistentPreflightEnvironment(preflightReport, parentEnv) {
   const inherited = preflightReport?.inherited;
   if (!isPlainObject(inherited)) {
@@ -108,7 +108,7 @@ function requireConsistentPreflightEnvironment(preflightReport, parentEnv) {
     for (const key of keys) {
       if (expected[key] !== current[key]) {
         fail(
-          'current environment no longer matches the environment the preflight report was generated from',
+          'current tracked environment presence no longer matches the preflight report',
         );
       }
     }
@@ -233,6 +233,67 @@ export function reverifyPinnedEntrypoint(distribution) {
   }
 }
 
+function filesystemObjectExistsNoFollow(targetPath) {
+  try {
+    fs.lstatSync(targetPath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+    fail('unable to verify pinned Gemini local-environment source boundary');
+  }
+}
+
+// Pinned v0.55.1 findEnvFile(workspaceDir, isTrusted, ignoreLocalEnv) checks
+// <workspace-or-ancestor>/.gemini/.env whenever isTrusted is true, regardless
+// of ignoreLocalEnv. After reaching the filesystem root it also checks the
+// effective home for .gemini/.env and .env. folderTrust.enabled=false is what
+// makes this isolated headless launch trusted, so those dotenv locations become
+// reachable unless the launcher explicitly closes them.
+//
+// This verifier intentionally uses lstat rather than reading or following the
+// candidate. Any filesystem object at the final candidate path (including a
+// symlink or FIFO) is enough to block; contents are never opened or returned.
+export function verifyNoPinnedGeminiEnvSource(runtime) {
+  if (
+    !isPlainObject(runtime) ||
+    typeof runtime.workingDirectory !== 'string' ||
+    runtime.workingDirectory.length === 0 ||
+    typeof runtime.geminiHome !== 'string' ||
+    runtime.geminiHome.length === 0
+  ) {
+    fail(
+      'runtime paths are unavailable for Gemini local-environment verification',
+    );
+  }
+
+  let current = path.resolve(runtime.workingDirectory);
+  while (true) {
+    const candidate = path.join(current, GEMINI_DIR, '.env');
+    if (filesystemObjectExistsNoFollow(candidate)) {
+      fail(
+        `pinned Gemini local-environment source is discoverable: ${candidate}`,
+      );
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  const home = path.resolve(runtime.geminiHome);
+  for (const candidate of [
+    path.join(home, GEMINI_DIR, '.env'),
+    path.join(home, '.env'),
+  ]) {
+    if (filesystemObjectExistsNoFollow(candidate)) {
+      fail(
+        `pinned Gemini local-environment source is discoverable: ${candidate}`,
+      );
+    }
+  }
+
+  return true;
+}
+
 export function buildLaunchContract(preflightReport, recorderOrigin) {
   const contract = structuredClone(
     buildAuthRoutingContract({
@@ -255,17 +316,18 @@ export function buildLaunchContract(preflightReport, recorderOrigin) {
   // to isTrusted=true the moment security.folderTrust.enabled is false, with
   // no dependency on GEMINI_CLI_TRUST_WORKSPACE or --skip-trust -- both of
   // which remain untouched here and stay on the forbidden/masked lists.
-  // This is deliberately narrower than either broad bypass: it only ever
-  // flips the *trust conclusion* for this one throwaway directory, not an
-  // env var or argv flag a future launcher path could accidentally forward
-  // elsewhere. Safe specifically because the cwd this trust conclusion
-  // applies to is always empty (verified immediately before spawn) and the
-  // isolated GEMINI_CLI_HOME has no pre-existing state either, so there is no
-  // real user/workspace settings content for the now-open workspace-merge
-  // gate to actually admit; and because every trust-gated behavior this
-  // contract cares about (approval mode, tools.allowed, IDE mode, workspace
-  // policy loading) is already independently pinned above and does not rely
-  // on the untrusted-folder fallback to reach its safe value.
+  // This is deliberately narrower than either broad bypass: it only flips the
+  // trust conclusion for this one throwaway directory, not an env var or argv
+  // flag a future launcher path could accidentally forward elsewhere. The
+  // empty cwd and isolated GEMINI_CLI_HOME keep real workspace/user settings
+  // out of the now-open merge gate, while approval mode, tools.allowed, IDE
+  // mode, and workspace-policy loading are independently pinned elsewhere.
+  //
+  // One pinned-v0.55.1 consequence needs a separate launch-time guard:
+  // isTrusted=true also makes findEnvFile() consider ancestor .gemini/.env
+  // files even when advanced.ignoreLocalEnv=true. verifyNoPinnedGeminiEnvSource()
+  // below mirrors that exact discoverability boundary and fails closed before
+  // spawn rather than relying on the host filesystem to happen to be clean.
   contract.isolatedSettings.security.folderTrust = { enabled: false };
   return contract;
 }
@@ -427,6 +489,7 @@ export async function runPhaseBLaunchProbe(options) {
 
     // These are the last state checks before the first real process spawn.
     verifyPhaseBRuntime(runtime);
+    verifyNoPinnedGeminiEnvSource(runtime);
     reverifyPinnedEntrypoint(distribution);
 
     const childEnvironment = buildLaunchEnvironment(runtime);

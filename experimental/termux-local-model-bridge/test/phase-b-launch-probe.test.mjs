@@ -10,6 +10,7 @@ import {
   resolvePinnedGeminiDistribution,
   reverifyPinnedEntrypoint,
   runPhaseBLaunchProbe,
+  verifyNoPinnedGeminiEnvSource,
 } from '../lib/phase-b-launch-probe.mjs';
 import {
   materializePhaseBRuntime,
@@ -28,10 +29,10 @@ import {
   presenceMap,
 } from '../lib/phase-b-preflight.mjs';
 
-// Builds a preflight report whose inherited-environment snapshot genuinely
-// matches parentEnv, so requireConsistentPreflightEnvironment() accepts it --
-// mirroring how a real caller must run preflight and launch against the same
-// environment snapshot, not just reuse a fixed report.
+// Builds a preflight report whose tracked inherited-environment presence
+// genuinely matches parentEnv, so requireConsistentPreflightEnvironment()
+// accepts it -- mirroring how a real caller must preserve the same tracked
+// presence profile between preflight and launch, without recording raw values.
 function buildPreflightReport(parentEnv = process.env) {
   return Object.freeze({
     schemaVersion: 1,
@@ -50,6 +51,16 @@ const GOOD_PREFLIGHT = buildPreflightReport();
 
 function makeTempParent() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'phase-b-launch-test-'));
+}
+
+function makeEnvBoundaryFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'phase-b-env-boundary-'));
+  const runtimeRoot = path.join(root, 'runtime');
+  const workingDirectory = path.join(runtimeRoot, 'cwd');
+  const geminiHome = path.join(runtimeRoot, 'gemini-home');
+  fs.mkdirSync(workingDirectory, { recursive: true });
+  fs.mkdirSync(geminiHome, { recursive: true });
+  return { root, runtimeRoot, workingDirectory, geminiHome };
 }
 
 function makeDistribution(tempParent, scriptBody) {
@@ -389,7 +400,177 @@ test('launch contract pins folder trust disabled alongside every other already-r
   assert.ok(contract.argvPolicy.forbiddenForwardPrefixes.includes('--skip-trust'));
 });
 
-test('runPhaseBLaunchProbe rejects a materially different launch environment than the preflight snapshot', async () => {
+test('pinned Gemini local-env verifier accepts a clean isolated boundary', () => {
+  const fixture = makeEnvBoundaryFixture();
+  try {
+    assert.equal(
+      verifyNoPinnedGeminiEnvSource({
+        workingDirectory: fixture.workingDirectory,
+        geminiHome: fixture.geminiHome,
+      }),
+      true,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('pinned Gemini local-env verifier blocks working-directory .gemini/.env', () => {
+  const fixture = makeEnvBoundaryFixture();
+  try {
+    const geminiDir = path.join(fixture.workingDirectory, '.gemini');
+    fs.mkdirSync(geminiDir);
+    fs.writeFileSync(path.join(geminiDir, '.env'), 'SECRET=not-read');
+    assert.throws(
+      () =>
+        verifyNoPinnedGeminiEnvSource({
+          workingDirectory: fixture.workingDirectory,
+          geminiHome: fixture.geminiHome,
+        }),
+      /pinned Gemini local-environment source is discoverable/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('pinned Gemini local-env verifier blocks runtime-ancestor .gemini/.env', () => {
+  const fixture = makeEnvBoundaryFixture();
+  try {
+    const geminiDir = path.join(fixture.runtimeRoot, '.gemini');
+    fs.mkdirSync(geminiDir);
+    fs.writeFileSync(path.join(geminiDir, '.env'), 'SECRET=not-read');
+    assert.throws(
+      () =>
+        verifyNoPinnedGeminiEnvSource({
+          workingDirectory: fixture.workingDirectory,
+          geminiHome: fixture.geminiHome,
+        }),
+      /pinned Gemini local-environment source is discoverable/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test(
+  'runPhaseBLaunchProbe blocks an ancestor .gemini/.env outside runtimeRoot before spawn',
+  async () => {
+  const tempParent = makeTempParent();
+  const marker = path.join(tempParent, 'child-spawned.txt');
+  try {
+    const geminiDir = path.join(tempParent, '.gemini');
+    fs.mkdirSync(geminiDir);
+    fs.writeFileSync(path.join(geminiDir, '.env'), 'SECRET=not-read');
+    const geminiRoot = makeDistribution(
+      tempParent,
+      `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'spawned');`,
+    );
+
+    await assert.rejects(
+      runPhaseBLaunchProbe({
+        geminiRoot,
+        preflightReport: GOOD_PREFLIGHT,
+        tempParent,
+        timeoutMs: 1500,
+      }),
+      /pinned Gemini local-environment source is discoverable/,
+    );
+    assert.equal(fs.existsSync(marker), false, 'child must never spawn');
+  } finally {
+    fs.rmSync(tempParent, { recursive: true, force: true });
+  }
+  },
+);
+
+test('pinned Gemini local-env verifier blocks isolated-home .gemini/.env fallback', () => {
+  const fixture = makeEnvBoundaryFixture();
+  try {
+    const geminiDir = path.join(fixture.geminiHome, '.gemini');
+    fs.mkdirSync(geminiDir);
+    fs.writeFileSync(path.join(geminiDir, '.env'), 'SECRET=not-read');
+    assert.throws(
+      () =>
+        verifyNoPinnedGeminiEnvSource({
+          workingDirectory: fixture.workingDirectory,
+          geminiHome: fixture.geminiHome,
+        }),
+      /pinned Gemini local-environment source is discoverable/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('pinned Gemini local-env verifier blocks isolated-home .env fallback', () => {
+  const fixture = makeEnvBoundaryFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.geminiHome, '.env'), 'SECRET=not-read');
+    assert.throws(
+      () =>
+        verifyNoPinnedGeminiEnvSource({
+          workingDirectory: fixture.workingDirectory,
+          geminiHome: fixture.geminiHome,
+        }),
+      /pinned Gemini local-environment source is discoverable/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('pinned Gemini local-env verifier blocks a symlink candidate without following it', () => {
+  const fixture = makeEnvBoundaryFixture();
+  try {
+    const geminiDir = path.join(fixture.workingDirectory, '.gemini');
+    fs.mkdirSync(geminiDir);
+    const target = path.join(fixture.root, 'dotenv-target');
+    fs.writeFileSync(target, 'SECRET=not-read');
+    try {
+      fs.symlinkSync(target, path.join(geminiDir, '.env'));
+    } catch {
+      return; // symlink creation unavailable on this platform.
+    }
+    assert.throws(
+      () =>
+        verifyNoPinnedGeminiEnvSource({
+          workingDirectory: fixture.workingDirectory,
+          geminiHome: fixture.geminiHome,
+        }),
+      /pinned Gemini local-environment source is discoverable/,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('pinned Gemini local-env verifier blocks a FIFO candidate without hanging', { timeout: 5000 }, () => {
+  const fixture = makeEnvBoundaryFixture();
+  try {
+    const geminiDir = path.join(fixture.workingDirectory, '.gemini');
+    fs.mkdirSync(geminiDir);
+    const fifo = path.join(geminiDir, '.env');
+    try {
+      execFileSync('mkfifo', [fifo]);
+    } catch {
+      return; // mkfifo unavailable on this platform/filesystem.
+    }
+    const start = Date.now();
+    assert.throws(
+      () =>
+        verifyNoPinnedGeminiEnvSource({
+          workingDirectory: fixture.workingDirectory,
+          geminiHome: fixture.geminiHome,
+        }),
+      /pinned Gemini local-environment source is discoverable/,
+    );
+    assert.ok(Date.now() - start < 2000, 'must lstat and fail without opening FIFO');
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('runPhaseBLaunchProbe rejects tracked environment-presence drift after preflight', async () => {
   const staleReport = buildPreflightReport({});
   await assert.rejects(
     runPhaseBLaunchProbe({
@@ -397,7 +578,7 @@ test('runPhaseBLaunchProbe rejects a materially different launch environment tha
       preflightReport: staleReport,
       parentEnv: { HTTPS_PROXY: 'http://attacker-proxy.example:8080' },
     }),
-    /current environment no longer matches/,
+    /current tracked environment presence no longer matches/,
   );
 });
 
@@ -433,23 +614,39 @@ test('preflight/launch environment consistency check compares presence only, nev
   assert.equal(/console\.(log|error)/.test(fn), false);
 });
 
-// verifyPhaseBRuntime (PR #5, unmodified here) is the runtime's own last
-// pre-spawn checkpoint, including cwd emptiness. This proves runPhaseBLaunchProbe
-// still wires it in immediately before constructing launcherArgs/spawning, and
-// that the underlying protection it depends on -- cwd-tampering detection --
-// still fails closed the same way PR #5's own suite already establishes.
-test('runtime integrity verification (including empty-cwd enforcement) remains wired in before spawn', async () => {
+// verifyPhaseBRuntime (PR #5, unmodified here) still enforces cwd/runtime
+// integrity. PR #6 then closes the pinned-v0.55.1 local-env discovery boundary
+// before the final entrypoint identity re-check and spawn. This proves those
+// synchronous gates remain ordered together immediately before process launch,
+// while the underlying cwd-tampering protection still fails closed.
+test('runtime and pinned local-env verification remain wired in before spawn', async () => {
   const source = await fs.promises.readFile(
     new URL('../lib/phase-b-launch-probe.mjs', import.meta.url),
     'utf8',
   );
-  const verifyCallIndex = source.indexOf('verifyPhaseBRuntime(runtime)');
-  const launcherArgsIndex = source.indexOf('const launcherArgs');
+  const runtimeVerifyIndex = source.indexOf('verifyPhaseBRuntime(runtime);');
+  const envVerifyIndex = source.indexOf(
+    'verifyNoPinnedGeminiEnvSource(runtime);',
+    runtimeVerifyIndex,
+  );
+  const entryVerifyIndex = source.indexOf(
+    'reverifyPinnedEntrypoint(distribution);',
+    envVerifyIndex,
+  );
+  const launcherArgsIndex = source.indexOf('const launcherArgs', entryVerifyIndex);
   const spawnCallIndex = source.indexOf('child = spawn(');
-  assert.ok(verifyCallIndex > 0, 'verifyPhaseBRuntime must still be called');
+  assert.ok(runtimeVerifyIndex > 0, 'verifyPhaseBRuntime must still be called');
   assert.ok(
-    verifyCallIndex < launcherArgsIndex && launcherArgsIndex < spawnCallIndex,
-    'verification must happen before argv construction and before spawn',
+    envVerifyIndex > runtimeVerifyIndex,
+    'local-env verification must follow runtime verification',
+  );
+  assert.ok(
+    entryVerifyIndex > envVerifyIndex,
+    'entrypoint identity must be rechecked after local-env verification',
+  );
+  assert.ok(
+    entryVerifyIndex < launcherArgsIndex && launcherArgsIndex < spawnCallIndex,
+    'all final verification must happen before argv construction and spawn',
   );
 
   // Confirm the mechanism it depends on is still intact: a cwd contaminated
