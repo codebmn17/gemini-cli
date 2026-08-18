@@ -99,10 +99,17 @@ cp -R "${SCRIPT_DIR}/lib" "${STAGE_DIR}/lib"
 cp -R "${SCRIPT_DIR}/vendor" "${STAGE_DIR}/vendor"
 cp "${SCRIPT_DIR}/PROVENANCE.json" "${STAGE_DIR}/PROVENANCE.json"
 
-# Mark the promoted (vendored) artifacts read-only, per-file, using each
+# Mark the promoted (vendored) FILES read-only, per-file, using each
 # file's PROVENANCE.json-recorded installedMode — this preserves the
 # accepted commit's executable-bit distinction (bin/*.mjs launchers stay
 # 0555; lib/*.mjs and package.json become 0444).
+#
+# Deliberately keep the containing vendor directories owner-writable. Android /
+# Termux enforces directory write permission for the rename, cleanup, and later
+# reinstall operations used below; chmod 0555 on those directories caused the
+# first real-device install to fail even though the file modes were correct.
+# The promoted-file integrity check is content/mode based and does not rely on
+# directory immutability as a same-user security boundary.
 "${GEMINI_LOCAL_NODE:-node}" -e '
 const fs = require("node:fs");
 const path = require("node:path");
@@ -119,13 +126,21 @@ for (const file of manifest.files) {
   fs.chmodSync(target, parseInt(file.installedMode, 8));
 }
 ' "${STAGE_DIR}"
-find "${STAGE_DIR}/vendor" -type d -exec chmod 555 {} +
 chmod 444 "${STAGE_DIR}/PROVENANCE.json"
 
 # Re-check the complete owned path boundary immediately before the first
 # destructive replacement. This narrows (but cannot eliminate) the accepted
 # same-user TOCTOU window between verification and pathname-based writes.
 preflight_install_paths
+
+# Recover cleanly from any older install that made vendor directories 0555.
+# This touches only the already-preflighted product-owned vendor tree and makes
+# its directories writable enough for replacement; promoted file modes remain
+# governed by PROVENANCE.json in the fresh staged payload.
+if [ -d "${DATA_DIR}/vendor" ]; then
+  find "${DATA_DIR}/vendor" -type d -exec chmod u+w {} + 2>/dev/null || true
+fi
+
 rm -rf "${DATA_DIR}/lib" "${DATA_DIR}/vendor" "${DATA_DIR}/PROVENANCE.json"
 mv "${STAGE_DIR}/lib" "${DATA_DIR}/lib"
 mv "${STAGE_DIR}/vendor" "${DATA_DIR}/vendor"
