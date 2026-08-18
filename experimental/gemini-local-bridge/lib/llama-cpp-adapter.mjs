@@ -31,9 +31,10 @@ import {
   createSseFrameSplitter,
   parseChatCompletionChunk,
 } from './llama-protocol.mjs';
+import { LOOPBACK_HOST, validateBackendOrigin } from './loopback-origin.mjs';
 
-const LOOPBACK_HOST = '127.0.0.1';
-const BACKEND_ORIGIN_RE = /^http:\/\/127\.0\.0\.1:(\d{1,5})$/;
+export { validateBackendOrigin };
+
 const CLIENT_DISCONNECTED = Symbol('client-disconnected');
 
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
@@ -85,23 +86,6 @@ function requirePositiveSafeInteger(name, value) {
     throw new TypeError(`${name} must be a positive safe integer`);
   }
   return value;
-}
-
-export function validateBackendOrigin(origin) {
-  if (typeof origin !== 'string') {
-    throw new TypeError('backendOrigin must be a string');
-  }
-  const match = BACKEND_ORIGIN_RE.exec(origin);
-  if (!match) {
-    throw new Error(
-      `backendOrigin must be exactly "http://127.0.0.1:<port>" (loopback-only, http-only, no hostname/path); got: ${JSON.stringify(origin)}`,
-    );
-  }
-  const port = Number(match[1]);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`backendOrigin port out of range: ${port}`);
-  }
-  return { host: LOOPBACK_HOST, port };
 }
 
 function rejectUnknownKeys(value, allowed, where) {

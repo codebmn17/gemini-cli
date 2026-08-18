@@ -40,6 +40,11 @@ export function resolveLayout(env = process.env) {
     configDir,
     provenancePath: path.join(dataDir, 'PROVENANCE.json'),
     vendorDir: path.join(dataDir, 'vendor', 'phase-b'),
+    // As of C2 this is the real local adapter configuration file (see
+    // lib/local-config.mjs) -- the filename predates C2 (it started as a
+    // presence-only placeholder doctor checked for) but the path is the
+    // single, already-documented "is the local backend configured" location,
+    // so C2 promotes it rather than introducing a second config path.
     adapterMarkerPath: path.join(configDir, 'llama-cpp-adapter.json'),
   };
 }
