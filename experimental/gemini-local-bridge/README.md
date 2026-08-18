@@ -115,10 +115,14 @@ fail-closed prompt handling, CLI dispatch, path-safety boundaries, non-root
 Termux directory permissions, and full install/reinstall/uninstall/`--purge`
 end-to-end behavior.
 
-The Phase C1 work described below adds 38 further tests on top of that
-56-test tree (94 total on this Linux host); **C1 has not been run on
-Termux/a device** — see the Phase C1 section for exactly what is and is
-not covered.
+The original Phase C1 author head `8e99448a87b0caa56017bc95df13ba5057066551`
+added 38 tests and passed **94/94** on its Linux host. Independent review then
+found bounded C1 defects in real llama.cpp usage-chunk handling, listener
+binding enforcement, streaming timeout coverage, backend response bounding,
+and closed-world request/query parsing. Those fixes add 10 further hardening
+regressions. **The complete suite must be rerun at the current PR head before
+a new aggregate pass count is claimed.** C1 has not been run on Termux/a
+device.
 
 ## Phase C1: local protocol-adapter core (host-only, not wired in)
 
@@ -129,8 +133,9 @@ slice does **not** install llama.cpp, does **not** download or select a
 GGUF model, does **not** launch the real Gemini CLI, does **not** change
 `run.mjs` (arbitrary prompts still fail closed — `gemini-local "hello"`
 still refuses, exactly as before), and **has not been run on a Termux
-device**. It was built and tested only on this Linux host, against a fake
-loopback llama.cpp-compatible server.
+device**. The original C1 author head was tested on Linux against a fake
+loopback llama.cpp-compatible server; the current hardening head still
+requires its final complete host rerun.
 
 ### Architecture
 
@@ -151,15 +156,11 @@ differ, not because the local model needs to pretend to be Gemini.
 
 The adapter is configured with a fixed **backend model identity** (e.g.
 `local-test-model`) that is always what is actually sent to llama.cpp. The
-Gemini-side request's model string (e.g. `gemini-2.5-pro`, resolvable
-because pinned Gemini CLI 0.55.1's legacy `resolveModel()` fallback passes
-an unrecognized model string through unchanged — see the C1 implementation
-report) is preserved only as protocol context (`clientRequestedModel`) and
-is **never** used to select or rename the backend model. Responses report
-the real backend model identity in `modelVersion` — never a
-Gemini-branded name — so nothing hides a mismatch between what Gemini
-CLI's UI might display and what actually generated the response. Final
-model-selection/UI resolution is explicitly deferred to a later slice.
+Gemini-side request's model string is preserved only as protocol context
+(`clientRequestedModel`) and is **never** used to select or rename the
+backend model. Responses report the real backend model identity in
+`modelVersion` — never a Gemini-branded name. Final model-selection/UI
+resolution is explicitly deferred to a later slice.
 
 ### Supported / rejected surface (text-only)
 
@@ -173,34 +174,38 @@ Rejected — explicitly, with a clear error, never silently dropped or
 faked: `embedContent` (llama.cpp embeddings require a separately
 configured embedding-capable model/pooling mode not guaranteed by the
 general local-chat path), tool/function declarations and calls, inline
-media/file data, cached content, `candidateCount > 1`, and any
-generation-config field without a faithful local equivalent (response
-schema/MIME type, logprobs, modalities, speech/thinking/image config).
+media/file data, cached content, `candidateCount > 1`, unknown semantic
+request/Part/generation fields, and any known generation-config field
+without a faithful local equivalent (response schema/MIME type, logprobs,
+modalities, speech/thinking/image config).
 
 ### Safety properties
 
-Binds only to literal `127.0.0.1`; the configured backend origin must be
-exactly `http://127.0.0.1:<port>` (no hostnames, no `0.0.0.0`, no IPv6, no
-https, no path) or the adapter refuses to start. Outbound backend headers
-are a fixed, closed allowlist built fresh for every request — Gemini-side
-credentials (`x-goog-api-key`, `Authorization`, cookies, installation/
-telemetry headers) and arbitrary custom headers are never forwarded.
-Request bodies and backend calls are bounded and time-limited; a client
-disconnect cancels the in-flight backend request. Any backend failure
-(unavailable, timeout, malformed response, unmapped finish reason) fails
-locally with a sanitized error — never a fallback to hosted Gemini or any
-other external endpoint, since the adapter has no other network
-destination it is capable of reaching.
+The adapter's exported server enforces literal `127.0.0.1` binding even if
+a caller omits the host and rejects an explicit non-loopback bind. The
+configured backend origin must be exactly `http://127.0.0.1:<port>` (no
+hostnames, no `0.0.0.0`, no IPv6, no https, no path) or construction fails.
+Outbound backend headers are a fixed, closed allowlist built fresh for every
+request — Gemini-side credentials (`x-goog-api-key`, `Authorization`, cookies,
+installation/telemetry headers) and arbitrary custom headers are never
+forwarded. Request bodies and non-stream backend responses are byte-bounded;
+backend timeouts remain active through streaming body consumption; a client
+disconnect cancels the in-flight backend request. Streaming accepts current
+llama.cpp's terminal usage-only `choices: []` chunk without treating it as a
+protocol failure. Any backend failure fails locally — never a fallback to
+hosted Gemini or another external endpoint.
 
 ### Testing
 
+Original author validation at `8e99448a87b0caa56017bc95df13ba5057066551`:
+
 ```sh
-cd experimental/gemini-local-bridge
-node --test test/llama-cpp-adapter.test.mjs
+node --test test/llama-cpp-adapter.test.mjs   # 38/38
+npm test                                      # 94/94 total
 ```
 
-38 tests against a fake, loopback-only llama.cpp-compatible HTTP server —
-no internet access, no real llama-server binary, no GGUF, no Gemini
-credentials, no Termux required. See the C1 implementation report for the
-exact pinned-SDK and llama.cpp-documentation derivation this was built
-against.
+Independent hardening adds `test/c1-hardening.test.mjs` with 10 focused
+regressions. A local isolated harness executed those 10 hardening regressions
+successfully after the correction, and the replacement `.mjs` files passed
+`node --check`; that harness is not a substitute for the required complete
+repository-host rerun at the exact current PR head.
