@@ -56,7 +56,7 @@ gemini-local-bridge/
   tools/generate-provenance.mjs  regenerates PROVENANCE.json from vendor/ on disk
   install-gemini-local.sh
   uninstall-gemini-local.sh
-  test/                          node:test suite (28 tests, run on this Linux host)
+  test/                          node:test suite (55 tests, run on this Linux host)
   docs/TERMUX.md                 exact copy-paste Termux commands + NOT-TESTED list
 ```
 
@@ -87,7 +87,7 @@ cd experimental/gemini-local-bridge
 npm test
 ```
 
-28/28 tests passing on this Linux host as of this bundle's build, covering:
+55/55 tests passing on this Linux host as of the final host-validation run, covering:
 path resolution, provenance/integrity verification (clean, tampered,
 missing-file cases), `doctor` behavior (including proof it never calls
 `fetch`, plus a static source check that it never imports
