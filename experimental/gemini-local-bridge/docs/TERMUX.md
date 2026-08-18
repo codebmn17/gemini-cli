@@ -1,10 +1,22 @@
 # Running gemini-local on Termux
 
-This bundle was built and validated on a Linux host only (see
-[Host-side validation vs. NOT TESTED](#host-side-validation-vs-not-tested)
-below). Nothing in this document has been executed on an actual Termux /
-Android device. Run these exact commands on-device and report back what
-actually happens — do not treat this document as proof that it works there.
+The current `gemini-local` skeleton/install lifecycle has been validated on a
+real Android/Termux device. The exact executable/test tree accepted on-device
+was:
+
+`a1b59aea2b70a5699956b4fe66b435d4a8c320a0`
+
+The accepted scope includes installation, integrity/doctor checks,
+fail-closed prompt behavior, the complete 56-test suite, default uninstall
+with config preservation, reinstall, `--purge`, final reinstall, and
+preservation of the existing Gemini CLI. This does **not** claim validation
+of future llama.cpp model inference or adapter/process-launch behavior that
+is not wired into this skeleton yet. See
+[Accepted device evidence and remaining deferred scope](#accepted-device-evidence-and-remaining-deferred-scope)
+below.
+
+The commands below remain the reproducible validation procedure for a fresh
+or future reviewed transport SHA.
 
 ## 1. Read-only environment inspection (do this first, before anything else)
 
@@ -47,16 +59,16 @@ installation has been separately authorized and completed.
 ## 2. Get the exact reviewed transport commit onto the device
 
 Do **not** install from a movable branch name. Obtain the exact 40-character
-PR #7 transport SHA from the independent acceptance report/handoff, paste it
-below, and check out that commit detached. The placeholder is intentionally
-not a valid SHA so an unedited copy-paste cannot proceed accidentally.
+transport SHA from the independent acceptance report/handoff, paste it below,
+and check out that commit detached. The placeholder is intentionally not a
+valid SHA so an unedited copy-paste cannot proceed accidentally.
 
 ```sh
 TRANSPORT_SHA='<EXACT_REVIEWED_PR7_SHA>'
 
 cd ~
-git clone --no-checkout https://github.com/codebmn17/gemini-cli.git
-cd gemini-cli
+git clone --no-checkout https://github.com/codebmn17/gemini-cli.git gemini-local-validation
+cd gemini-local-validation
 git fetch origin "$TRANSPORT_SHA"
 git checkout --detach "$TRANSPORT_SHA"
 ACTUAL_SHA="$(git rev-parse HEAD)"
@@ -91,10 +103,17 @@ is a symlink or an unexpected filesystem object. It does not touch any
 existing `gemini` binary, any globally installed `@google/gemini-cli` npm
 package, or any path under Termux's `$PREFIX`.
 
+Promoted files retain their reviewed manifest-declared installed modes:
+`0555` for promoted executable launchers and `0444` for promoted
+libraries/package metadata. Their containing vendor directories remain
+owner-writable so a normal non-root Termux user can rename, reinstall,
+clean up staging, and uninstall safely.
+
 ## 4. Put the launcher on PATH
 
-The installer does not edit your shell startup file automatically. Add this
-yourself (once) to `~/.bashrc` (or your shell's equivalent), then reload it:
+The installer does not edit your shell startup file automatically. If
+`~/.local/bin` is not already on PATH, add this yourself (once) to
+`~/.bashrc` (or your shell's equivalent), then reload it:
 
 ```sh
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
@@ -104,15 +123,19 @@ source ~/.bashrc
 ## 5. Verify
 
 ```sh
-which gemini-local
+command -v gemini-local
+command -v gemini
 gemini-local version
+gemini --version
 gemini-local doctor
+echo "doctor exit: $?"
 ```
 
 `doctor` performs filesystem reads and SHA-256 hashing only — no model
-inference, no network request. Expect it to report `NOT READY` (no
-llama.cpp adapter installed yet) and `vendored-artifact-integrity: OK`. If
-integrity is not OK, stop and report the exact failure — do not proceed.
+inference, no network request. At the current skeleton stage it should report
+`installState: installed-ok`, `vendored-artifact-integrity` with zero
+failures, and `NOT READY` because no llama.cpp adapter is installed. A
+healthy skeleton doctor exits 0.
 
 For a machine-readable report:
 
@@ -127,65 +150,118 @@ gemini-local "hello, can you help me write a poem?"
 echo "exit code: $?"
 ```
 
-Expected: a non-zero exit and a message stating gemini-local never falls
-back to hosted Gemini and has no local inference backend installed yet.
-If this instead appears to contact a network endpoint or produce model
-output, stop and report that immediately — it would mean the fail-closed
-guarantee is broken on-device even though it held on the Linux host.
+Expected: no model answer, a non-zero exit, and a message stating that
+`gemini-local` never falls back to hosted Gemini and has no local inference
+backend installed yet. If this instead appears to contact a network endpoint
+or produce model output, stop and report that immediately.
 
-## 7. (Optional) run the automated test suite on-device
+## 7. Run the automated test suite on-device
 
 ```sh
 npm test
+
+MJS_COUNT=0
+while IFS= read -r -d '' f; do
+  node --check "$f" || exit 1
+  MJS_COUNT=$((MJS_COUNT + 1))
+done < <(find . -type f -name '*.mjs' -print0)
+echo "mjs files checked: $MJS_COUNT"
+
+bash -n install-gemini-local.sh
+bash -n uninstall-gemini-local.sh
 ```
 
-This exercises the same install/uninstall/doctor/fail-closed tests that
-were run on the Linux host, but against Termux's real filesystem and Node
-build. Report the exact pass/fail counts.
+Report the exact pass/fail counts rather than inferring them from a previous
+run.
 
-## 8. Uninstall
+## 8. Lifecycle validation
+
+Default uninstall must remove the launcher and data directory while
+preserving the config directory:
 
 ```sh
-bash uninstall-gemini-local.sh          # keeps ~/.config/gemini-local-bridge/
-bash uninstall-gemini-local.sh --purge  # also removes ~/.config/gemini-local-bridge/
+CONFIG_DIR="$HOME/.config/gemini-local-bridge"
+printf 'preserve-me\n' > "$CONFIG_DIR/device-validation-marker.txt"
+
+bash uninstall-gemini-local.sh
+hash -r
+command -v gemini-local || true
+test ! -e "$HOME/.local/share/gemini-local-bridge"
+cat "$CONFIG_DIR/device-validation-marker.txt"
+command -v gemini
+gemini --version
 ```
 
-Uninstall performs its complete path-safety preflight before its first
-chmod/remove operation. If an owned target or relevant ancestor is unsafe,
-it fails closed without deliberately beginning a partial uninstall.
+Reinstall, verify `doctor` again, then test purge:
 
-## Host-side validation vs. NOT TESTED
+```sh
+bash install-gemini-local.sh
+gemini-local doctor
 
-Validated on the Linux host that built this bundle:
+bash uninstall-gemini-local.sh --purge
+hash -r
+command -v gemini-local || true
+test ! -e "$HOME/.local/bin/gemini-local"
+test ! -e "$HOME/.local/share/gemini-local-bridge"
+test ! -e "$HOME/.config/gemini-local-bridge"
+command -v gemini
+gemini --version
+```
 
-- install/reinstall idempotency, uninstall (default and `--purge`)
-- `doctor`/`status`/`version`/`help` output and exit codes
-- SHA-256 integrity detection of a tampered vendored file
-- fail-closed refusal of an arbitrary prompt (non-zero exit, no hosted-Gemini
-  fallback wording)
-- `doctor` making no network call (proved by poisoning `fetch`) and a static
-  source check that `doctor.mjs`/`run.mjs` never import `node:child_process`,
-  `node:net`, `node:http(s)`, or call `fetch`
-- the installer/uninstaller never reference `npm`, a hardcoded Termux
-  package path, or the real `gemini`/`@google/gemini-cli` install location
-- host-side regressions for ancestor-symlink refusal and uninstall complete
-  preflight-before-destruction behavior
+Finally reinstall so the device is left in the intended installed skeleton
+state, rerun `doctor`, reconfirm the exact detached HEAD, and verify that no
+`.stage.*` directory remains.
 
-Explicitly **NOT TESTED** — only verifiable by running the commands above
-on a real device, not assumed to work:
+## Accepted device evidence and remaining deferred scope
 
-- Android/Termux filesystem semantics (permission bits, symlink handling,
-  storage backend behavior under Termux's sandboxed filesystem)
-- the actual Termux `$PREFIX` and its interaction (or lack thereof) with
-  this installer
-- resolution of an actually-installed Gemini CLI (`gemini`) on a real
-  Termux `$PATH`
-- actual `~/.local/bin` `$PATH` behavior in a real Termux shell session
-- actual Termux Node.js/npm behavior (version availability, `node --test`
-  support, native module behavior)
-- llama.cpp availability/behavior on Termux (no adapter exists yet in this
-  slice — `doctor` is expected to report it absent)
-- real-device process spawning behavior
+The exact executable/test tree
+`a1b59aea2b70a5699956b4fe66b435d4a8c320a0` was validated on a real
+Android 15 / aarch64 Termux device with:
 
-Do not report Termux acceptance until each of the above has actually been
-run on-device and its real output recorded.
+- Git 2.55.0
+- Node v26.4.0
+- npm 11.19.0
+- existing Gemini CLI 0.55.1 at Termux `$PREFIX/bin/gemini`
+
+The first device candidate (`c62673212f716732a87a3e54b7f4daa760c3790e`)
+exposed a real non-root filesystem defect: staged vendor directories were
+changed to mode `0555` before rename/cleanup, causing `Permission denied`.
+The correction removed directory lock-down while preserving promoted file
+modes and added a dedicated Termux directory-permission regression.
+
+At the corrected exact tree `a1b59aea...`, real-device evidence was:
+
+- targeted non-root Termux directory-permission regression: **1/1 passed**
+- real installer: **PASS**
+- no stale `.stage.*` directories after successful install
+- `gemini-local doctor`: `installed-ok`, exact 10-file provenance set,
+  vendored integrity 10/10 with zero failures, expected adapter-absent
+  `NOT READY`, exit **0**
+- arbitrary prompt: no model answer, explicit no-hosted-fallback refusal,
+  exit **3**
+- complete current-head suite: **56/56 passed**, 0 failed/cancelled/skipped/todo
+- all **20/20** applicable `.mjs` files passed `node --check`
+- installer and uninstaller both passed `bash -n`
+- default uninstall: exit 0, launcher/data removed, config marker
+  `preserve-me` survived, normal Gemini remained 0.55.1
+- reinstall after default uninstall: **PASS**, healthy doctor restored
+- purge: exit 0, launcher/data/config removed, `gemini-local` no longer
+  resolved after `hash -r`, normal Gemini remained 0.55.1
+- final reinstall: healthy `installed-ok` doctor, exit 0, normal Gemini still
+  0.55.1, exact HEAD still `a1b59aea...`, no stale `.stage.*` directory
+
+**Accepted for the current skeleton/install lifecycle on this tested Termux
+device.**
+
+Still deferred / not claimed by this acceptance:
+
+- installation or configuration of a llama.cpp adapter
+- actual local model inference, streaming, token counting, embeddings, or
+  model traffic
+- future adapter/launcher process-spawn behavior that is not wired into this
+  skeleton
+- behavior on other Android/Termux versions, architectures, shells, or
+  device filesystems not represented by this validation device
+
+Those deferred capabilities require their own exact-SHA implementation and
+real-device validation before they may inherit a Termux acceptance claim.
