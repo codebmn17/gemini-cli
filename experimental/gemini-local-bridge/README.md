@@ -446,3 +446,115 @@ GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT=<real pinned checkout> npm test   # 154/154
 C1's own 104 tests are unchanged and still pass; C2 does not weaken or
 bypass any C1 request/response validation. Neither C1 nor C2 has been run
 on a Termux/Android device — Linux-host validation only.
+
+## Phase C3: real local-inference proof (Linux host only)
+
+Proves the full chain with a **real** llama.cpp server and a **real** GGUF
+model — no fake backend — while making **zero changes to C1/C2 code**:
+existing `lib/gemini-protocol.mjs`, `lib/llama-protocol.mjs`,
+`lib/llama-cpp-adapter.mjs`, `lib/local-config.mjs`, and
+`lib/local-gemini-runner.mjs` worked against the real pinned llama.cpp
+server exactly as already accepted at C2. C3 is evidence and documentation
+only in this repository; nothing under `experimental/gemini-local-bridge/`
+changed.
+
+```text
+Official Gemini CLI 0.55.1 -> C1 adapter -> real llama-server -> real GGUF
+```
+
+### Pinned llama.cpp
+
+Commit `0021a77de0a8966059dc94548fb3b96654e0bb12` of
+[`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) — the same
+commit C2 already derived its `/health`/`/v1/chat/completions`/
+`/v1/chat/completions/input_tokens`/streaming contract from. Independently
+re-derived directly from that exact commit's own source (`tools/server/README.md`,
+`tools/server/server-task.cpp`, and its own Python test suite) before
+building: every C1/C2 protocol assumption held with **zero adapter code
+changes required** — including the exact usage-only streaming chunk shape
+(`choices: []` with `usage`) C1's own hardening pass had already handled.
+
+Built CPU-only from that exact checkout (`cmake -B build -DCMAKE_BUILD_TYPE=Release`,
+`cmake --build build --config Release --target llama-server`, GCC 13.3.0 /
+CMake 3.28.3 on x86_64) into disposable scratch storage outside this
+repository — no llama.cpp source, build artifact, or binary is committed
+here. `llama-server --version` reported `version: 0.1.1-dev (build 10479,
+commit 0021a77de)`.
+
+### Smoke-test model
+
+[`Qwen/Qwen2.5-0.5B-Instruct-GGUF`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF),
+file `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Q4_K_M, ~491.4 MB), published by
+Qwen/Alibaba, Apache-2.0 licensed, qwen2 architecture. Chosen for this
+smoke test specifically because it's officially published (not a
+third-party requant), small enough for later phone deployment, and
+text/chat-capable with no multimodal dependency — **not** a claim that this
+is the intended permanent local coding model; model selection for real use
+remains a separate, later decision. Downloaded to disposable scratch
+storage only, never committed here.
+
+Launched loopback-only, tools/UI/MCP disabled by leaving every relevant
+flag at its documented default (`--tools`/`--agent` default to "no tools" —
+neither was passed; no `--mcp-servers-config`/`--mcp-servers-json` was
+supplied), an explicit neutral backend alias matching C2's `backendModel`,
+and `--offline` once the GGUF was already local:
+
+```sh
+llama-server -m qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  --host 127.0.0.1 --port 8090 -a qwen-test-backend --no-webui --offline
+```
+
+### Real host proof
+
+With that real server running, `lib/local-gemini-runner.mjs`'s
+`runLocalGeminiPrompt()` ran, completely unmodified, against a C2 config
+pointing `backendOrigin` at the real server: the real pinned Gemini CLI
+launched, sent its request through the real C1 adapter, the adapter
+forwarded to the real `llama-server`, and the real 0.5B model generated the
+response `"C3_LOCAL_REAL_OK"` — the exact requested token, verbatim (not
+required as the sole success criterion for a model this small, but it
+happened). `backendModel` (`qwen-test-backend`) and `clientModel`
+(`local-test-client`) were reported distinctly, matching C1/C2's identity
+separation exactly as before.
+
+A transparent, zero-transformation logging passthrough was placed in front
+of the real server purely for request auditing (real GGUF inference still
+happened entirely on the real `llama-server`; the passthrough only
+recorded what arrived, unmodified, before forwarding byte-for-byte) — it
+confirmed no `x-goog-api-key`/`Authorization` header ever reached the
+backend, a canary value planted in place of a real `GEMINI_API_KEY` in the
+parent environment never appeared anywhere the backend received, and the
+request body's `model` field was always `qwen-test-backend`, never
+`local-test-client`. After the run, no `gemini-local-phase-b-*` runtime
+directory remained and no orphaned Gemini/adapter process remained running
+— cleanup held exactly as in every C2 test.
+
+### Testing
+
+No C3-specific regression file was added — real execution against existing
+C1/C2 code required no code change, so there was nothing new to add a
+regression for. The full existing suite was rerun, unchanged, both before
+and after the real host proof:
+
+```sh
+npm test                                                              153/153 + 1 skipped by default
+GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT=<real pinned checkout> npm test   154/154
+```
+
+`.mjs` syntax: 31/31 (unchanged). Both installer/uninstaller scripts pass
+`bash -n` (unchanged). `vendor/phase-b/` and `PROVENANCE.json`: untouched
+(no repository file changed during C3 host work at all).
+
+### Termux
+
+**Not yet C3-device-accepted.** A read-only-first, package-authorization-gated
+device-validation plan for the same known aarch64/Android/Termux target
+already used for the skeleton acceptance is in
+[`docs/TERMUX.md`](docs/TERMUX.md#c3-device-validation-plan-not-yet-executed).
+It has not been executed. No package installation, model download, or
+device mutation happens automatically — every such step is explicitly
+gated behind separate user authorization at execution time, and the plan
+preserves the device's existing `gemini`, existing Ollama, existing user
+data, and `$PREFIX` outside that explicitly authorized scope. There is no
+automatic model download and no automatic package installation anywhere in
+this repository or its scripts.

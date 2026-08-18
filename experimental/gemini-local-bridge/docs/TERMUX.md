@@ -272,3 +272,226 @@ Still deferred / not claimed by this acceptance:
 
 Those deferred capabilities require their own exact-SHA implementation and
 real-device validation before they may inherit a Termux acceptance claim.
+
+## C3 device-validation plan (NOT YET EXECUTED)
+
+This section is a **plan only**. None of it has been run on the device. It
+exists so the eventual device session has an exact, reviewed procedure to
+follow rather than improvising one live. Phase C3 (real llama.cpp + a real
+GGUF, proven end to end against the real pinned Gemini CLI) has been proven
+on a Linux host only — see this bundle's README for that host evidence. This
+plan is what turns that host proof into a device acceptance claim; until it
+is actually run and its results recorded, no such claim exists.
+
+### C3-0. Read-only device inspection (run this first; changes nothing)
+
+```sh
+uname -m
+uname -a
+printf 'HOME=%s\n' "$HOME"
+printf 'PREFIX=%s\n' "$PREFIX"
+df -h "$HOME" 2>/dev/null || df -h "$PREFIX"
+free -h 2>/dev/null || cat /proc/meminfo 2>/dev/null | head -3
+
+command -v git || true
+git --version 2>/dev/null || true
+command -v node || true
+node --version 2>/dev/null || true
+command -v npm || true
+npm --version 2>/dev/null || true
+command -v gemini || true
+gemini --version 2>/dev/null || true
+command -v gemini-local || true
+gemini-local doctor 2>/dev/null || true
+
+command -v clang || true
+clang --version 2>/dev/null || true
+command -v cc || true
+command -v cmake || true
+cmake --version 2>/dev/null || true
+command -v make || true
+command -v ninja || true
+ninja --version 2>/dev/null || true
+
+command -v llama-server || true
+command -v llama-cli || true
+command -v ollama || true
+ollama --version 2>/dev/null || true
+```
+
+Record the full output before anything else. This establishes exactly what
+is already present — a Node/npm/git/`gemini` toolchain is expected to
+already be there from the accepted skeleton validation above, but that must
+be **re-confirmed on this run**, never assumed from the earlier report.
+**Do not run `pkg update`, `pkg install`, `pkg upgrade`, or any other
+package-manager mutation as part of this step or to make this step
+possible.** This is read-only.
+
+### C3-1. Determine what (if anything) needs installing
+
+Building `llama-server` needs a C/C++ toolchain and CMake at minimum (a
+generator such as `make` or `ninja`; Termux's `cmake` package pulls in a
+usable generator). Only if C3-0 shows any of `clang`/`cc`, `cmake`, or a
+generator (`make`/`ninja`) missing, the candidate Termux packages are:
+
+```text
+pkg install clang cmake make git
+```
+
+**REQUIRES USER AUTHORIZATION BEFORE RUNNING.** Do not run this — or any
+`pkg install`/`pkg update` — until:
+
+- C3-0's output has actually been seen and reviewed (not assumed), and
+- the user has explicitly authorized this exact install list for this
+  exact device.
+
+If C3-0 already shows a working toolchain (a real possibility, since Termux
+devices used for development often already carry one), **skip this step
+entirely** — do not install anything "just in case." Do not substitute a
+different package list than what C3-0's gaps actually show.
+
+### C3-2. Build llama-server from the exact pinned commit
+
+Same pinned commit already built and proven on the Linux host in this
+bundle's README — do not substitute `master` or any other commit:
+
+```sh
+cd ~
+git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git llama-cpp-c3
+cd llama-cpp-c3
+git fetch origin 0021a77de0a8966059dc94548fb3b96654e0bb12
+git checkout 0021a77de0a8966059dc94548fb3b96654e0bb12
+git rev-parse HEAD   # must print 0021a77de0a8966059dc94548fb3b96654e0bb12 -- stop if it does not
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --target llama-server
+./build/bin/llama-server --version
+```
+
+No aarch64/NEON-specific flags are invented here: CMake's default
+architecture detection (`GGML_NATIVE`, on by default) is what the Linux
+host build also relied on, and the pinned commit's own build system is
+authoritative for whatever it auto-detects on-device. If the build fails or
+produces a materially different `--version` output than the Linux host's
+(`version: 0.1.1-dev (build 10479, commit 0021a77de)`, exact build number
+aside), stop and report the exact discrepancy rather than patching around
+it.
+
+This clones into `~/llama-cpp-c3` — outside `$PREFIX` and outside any
+`gemini-local` install location. It never touches `~/.local/bin`,
+`~/.local/share/gemini-local-bridge/`, `~/.config/gemini-local-bridge/`, or
+`$PREFIX` itself.
+
+### C3-3. Download the smoke-test GGUF (separately authorized)
+
+Same model already selected and proven on the Linux host:
+`Qwen/Qwen2.5-0.5B-Instruct-GGUF`, file `qwen2.5-0.5b-instruct-q4_k_m.gguf`,
+Apache-2.0 licensed, **~491.4 MB download, ~468.7 MiB on disk**. Confirm free
+storage from C3-0 comfortably covers this (host build + this file is under
+1 GB total) before proceeding.
+
+**REQUIRES USER AUTHORIZATION BEFORE RUNNING** — this is a real, sizeable
+download over the device's network connection:
+
+```sh
+mkdir -p ~/c3-models
+cd ~/c3-models
+curl -sSL -o qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+sha256sum qwen2.5-0.5b-instruct-q4_k_m.gguf
+```
+
+Expected SHA-256 (from the Linux host download):
+`74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`. If the
+device's hash differs, stop and report it rather than proceeding with a
+file that doesn't match what was already verified.
+
+### C3-4. Start the real backend, loopback only
+
+```sh
+~/llama-cpp-c3/build/bin/llama-server \
+  -m ~/c3-models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  --host 127.0.0.1 \
+  --port 8090 \
+  -a qwen-test-backend \
+  --no-webui \
+  --offline
+```
+
+Never `--host 0.0.0.0`. No `--tools`, no `--agent`, no `--mcp-servers-config`
+/ `--mcp-servers-json` — all default to disabled/off and must stay that way.
+
+### C3-5. Direct backend sanity checks (same as the host proof)
+
+```sh
+curl -sS http://127.0.0.1:8090/health
+curl -sS http://127.0.0.1:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen-test-backend","messages":[{"role":"user","content":"Reply with exactly the word: pineapple"}],"max_tokens":20,"stream":false}'
+```
+
+Expect `{"status":"ok"}` and a real, non-empty generated response. If either
+differs from the host proof's shape, stop before continuing to C3-6.
+
+### C3-6. Real full-chain proof on-device
+
+Write a local config pointing at the on-device pieces (`~/.config/gemini-local-bridge/llama-cpp-adapter.json`):
+
+```json
+{
+  "schemaVersion": 1,
+  "backend": "llama.cpp",
+  "backendOrigin": "http://127.0.0.1:8090",
+  "backendModel": "qwen-test-backend",
+  "clientModel": "local-test-client",
+  "geminiRoot": "<path to the existing on-device @google/gemini-cli 0.55.1 install>"
+}
+```
+
+`geminiRoot` must point at the **existing** on-device pinned Gemini CLI
+0.55.1 install already confirmed by C3-0 (`gemini --version`) — do not
+install a second copy. Then, with the real backend from C3-4 still running:
+
+```sh
+gemini-local "Reply with the exact token C3_LOCAL_REAL_OK and nothing else."
+echo "exit code: $?"
+```
+
+Do not treat exact-token compliance as the sole success signal if the
+device's response differs from the host's — record whatever the model
+actually returned. Required, independently checkable evidence: exit 0; a
+non-empty response; `gemini-local doctor`/the response itself never
+mentions a Gemini-branded model name for the backend; the real backend log
+(if verbose logging is enabled) shows `backendModel`, never `clientModel`;
+no leftover `gemini-local-phase-b-*` directory under the device's temp
+directory afterward; the llama-server process from C3-4 still running
+undisturbed (it is not restarted or reconfigured by this step).
+
+### C3-7. Cleanup and preservation check
+
+```sh
+# Stop the C3 llama-server (Ctrl-C or kill its PID) once done.
+command -v gemini
+gemini --version
+command -v ollama
+ollama --version 2>/dev/null || true
+gemini-local doctor
+```
+
+Confirm: the pre-existing `gemini` binary/version is unchanged, any
+pre-existing Ollama install is untouched, no `pkg`-managed file outside the
+C3-1 authorized install list was modified, and `gemini-local`'s own install
+state (from the accepted skeleton lifecycle) is unaffected. `~/llama-cpp-c3`
+and `~/c3-models` are disposable scratch directories the user may remove
+once done; they were never referenced by `gemini-local`'s own installed
+paths.
+
+### What this plan does not authorize
+
+Running this plan does not itself authorize `pkg install`/`pkg update`
+(C3-1), the GGUF download (C3-3), or anything else marked **REQUIRES USER
+AUTHORIZATION BEFORE RUNNING** above — those remain separate, explicit
+approvals at execution time, not blanket pre-approval from this document
+existing. This plan does not claim C3 device acceptance; only an actually
+executed run, with recorded real results (not a rerun of the host numbers
+above), can.
