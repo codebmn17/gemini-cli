@@ -15,6 +15,7 @@ import { verifyProvenance, sha256File } from '../lib/integrity.mjs';
 import { runDoctor, formatDoctorReport } from '../lib/doctor.mjs';
 import { attemptRun, FAIL_CLOSED_EXIT_CODE } from '../lib/run.mjs';
 import { main, GEMINI_LOCAL_BRIDGE_VERSION } from '../lib/cli.mjs';
+import { PINNED_GEMINI_CLI_VERSION } from '../vendor/phase-b/lib/phase-b-auth-routing.mjs';
 
 const bundleRoot = path.resolve(fileURLToPath(import.meta.url), '..', '..');
 
@@ -58,6 +59,31 @@ function stageRealPayload(home) {
     chmodSync(path.join(dataDir, file.bundlePath), parseInt(file.installedMode, 8));
   }
   return { dataDir, configDir, binDir };
+}
+
+// A minimal directory shaped exactly enough to satisfy
+// resolvePinnedGeminiDistribution's manifest/entrypoint checks (real package
+// name, real pinned version, a real non-symlink bin/gemini.js file at the
+// declared relative path) -- content of gemini.js is irrelevant here, since
+// these doctor/local-config tests never spawn it. Deliberately NOT the real
+// multi-hundred-MB pinned Gemini CLI build: that only exists in a
+// session-specific scratchpad location, never committed to this repo, so it
+// cannot be what a committed test depends on.
+function writeFakeGeminiDistribution(root) {
+  mkdirSync(path.join(root, 'bundle'), { recursive: true });
+  writeFileSync(
+    path.join(root, 'package.json'),
+    JSON.stringify({
+      name: '@google/gemini-cli',
+      version: PINNED_GEMINI_CLI_VERSION,
+      bin: { gemini: 'bundle/gemini.js' },
+    }) + '\n',
+  );
+  writeFileSync(
+    path.join(root, 'bundle', 'gemini.js'),
+    '#!/usr/bin/env node\n// fake distribution for doctor/local-config tests only -- never executed.\n',
+  );
+  return root;
 }
 
 // --- paths.mjs -------------------------------------------------------
@@ -305,10 +331,12 @@ test('doctor on a completely uninstalled HOME reports not-installed (not a struc
     // not corruption, so it must not be reported as a structural failure.
     assert.equal(report.structuralFailure, false);
     assert.equal(report.checks.find((c) => c.name === 'data-dir-exists').ok, false);
-    // Adapter-absence must not itself read as a failed check (it's expected).
-    const adapterCheck = report.checks.find((c) => c.name === 'llama-cpp-adapter-installed');
-    assert.equal(adapterCheck.ok, true);
-    assert.equal(adapterCheck.installed, false);
+    // Config-absence must not itself read as a failed check (it's expected).
+    const configCheck = report.checks.find((c) => c.name === 'local-config-valid');
+    assert.equal(configCheck.ok, true);
+    assert.equal(configCheck.configured, false);
+    assert.equal(report.local.configured, false);
+    assert.equal(report.hostedFallback, 'disabled');
     assert.match(formatDoctorReport(report), /NOT INSTALLED/);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -366,13 +394,59 @@ test('doctor on a freshly staged install reports OK structural checks and NOT RE
   }
 });
 
-test('doctor becomes localInferenceReady only once BOTH integrity holds AND an adapter marker exists', () => {
+// Before C2, ANY file at the config path -- even this placeholder -- made
+// localInferenceReady true, while every prompt still unconditionally failed
+// closed regardless of that file's content (see the old README/C1 section).
+// C2 promotes this same path to a real, schema-validated config
+// (lib/local-config.mjs), so localInferenceReady now means "this config
+// parses and would be used for a real launch attempt" -- a file that
+// doesn't match the schema must read as present-but-invalid, not ready.
+test('doctor becomes localInferenceReady only once BOTH integrity holds AND the local config is schema-valid', () => {
   const home = makeTempHome();
   try {
     const { configDir } = stageRealPayload(home);
-    writeFileSync(path.join(configDir, 'llama-cpp-adapter.json'), '{"placeholder":true}\n');
-    const report = runDoctor({ HOME: home });
+    const configPath = path.join(configDir, 'llama-cpp-adapter.json');
+    const geminiRoot = path.join(home, 'fake-gemini-root');
+    writeFakeGeminiDistribution(geminiRoot);
+
+    writeFileSync(configPath, '{"placeholder":true}\n');
+    let report = runDoctor({ HOME: home });
+    assert.equal(report.localInferenceReady, false);
+    assert.equal(report.local.configured, false);
+    const invalidCheck = report.checks.find((c) => c.name === 'local-config-valid');
+    assert.equal(invalidCheck.configured, false);
+    assert.match(invalidCheck.detail, /present but invalid/);
+    // Still not a structural (package-integrity) failure -- it's the
+    // user's own runtime config that's wrong, not the installed bundle.
+    assert.equal(report.structuralFailure, false);
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        schemaVersion: 1,
+        backend: 'llama.cpp',
+        backendOrigin: 'http://127.0.0.1:8080',
+        backendModel: 'qwen-test-backend',
+        clientModel: 'local-test-client',
+        geminiRoot,
+      }) + '\n',
+    );
+    report = runDoctor({ HOME: home });
     assert.equal(report.localInferenceReady, true);
+    assert.equal(report.local.configured, true);
+    assert.equal(report.local.host, geminiRoot);
+    assert.equal(report.local.backend, 'llama.cpp');
+    assert.equal(report.local.backendOrigin, 'http://127.0.0.1:8080');
+    // Gemini-side and backend-side model identities are reported distinctly
+    // and must never collapse into a single "model" field.
+    assert.equal(report.local.clientModel, 'local-test-client');
+    assert.equal(report.local.backendModel, 'qwen-test-backend');
+    // Doctor is filesystem-only: it must never claim to know backend
+    // reachability, only that a valid config exists.
+    assert.equal(report.local.backendHealth, 'not probed by doctor');
+    assert.equal(report.hostedFallback, 'disabled');
+    assert.match(formatDoctorReport(report), /Backend health: not probed by doctor/);
+    assert.match(formatDoctorReport(report), /Hosted fallback: disabled/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -400,34 +474,88 @@ test('doctor never touches fetch: poisoning it still lets doctor complete normal
 
 // --- run.mjs (fail-closed) ------------------------------------------------
 
-test('attemptRun always fails closed with a clear message, regardless of args', () => {
-  for (const args of [[], ['hello'], ['--yolo'], ['tell me a secret']]) {
-    const result = attemptRun(args, {});
-    assert.equal(result.ok, false);
-    assert.equal(result.exitCode, FAIL_CLOSED_EXIT_CODE);
-    assert.match(result.message, /never falls back to hosted Gemini/);
+// As of C2, attemptRun consults lib/local-config.mjs's loadLocalConfig() to
+// decide whether a real launch is even possible, so it needs a resolvable
+// (and here, isolated) HOME rather than `{}` -- `{}` would fall through to
+// the real developer/CI-runner home directory via os.homedir() and could
+// pick up a real config. Using a fresh temp HOME with nothing installed
+// under it guarantees loadLocalConfig() sees "not found" every time,
+// exercising exactly the no-config fail-closed path this test covers.
+// attemptRun is async as of C2 (a real launch attempt awaits the runner).
+test('attemptRun always fails closed with a clear message when no local config exists, regardless of args', async () => {
+  const home = makeTempHome();
+  try {
+    for (const args of [[], ['hello'], ['--yolo'], ['tell me a secret']]) {
+      const result = await attemptRun(args, { HOME: home });
+      assert.equal(result.ok, false);
+      assert.equal(result.exitCode, FAIL_CLOSED_EXIT_CODE);
+      assert.match(result.message, /never falls back to hosted Gemini/);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
-test('doctor.mjs and run.mjs source never actually import/call network or process-spawn primitives (static regression guard)', () => {
+test('doctor.mjs source never itself imports/calls network or process-spawn primitives (static regression guard)', () => {
   // Matches real usage (import/require/dynamic-import statements, or a
-  // direct fetch(...) call) rather than a bare substring, so the modules'
+  // direct fetch(...) call) rather than a bare substring, so the module's
   // own explanatory doc comments (which legitimately name these forbidden
-  // primitives in prose) don't trip this guard.
+  // primitives, and this vendor filename, in prose) don't trip this guard.
+  // Unlike run.mjs (see the next test), doctor.mjs's own code is still
+  // unconditionally forbidden from calling any of these directly or
+  // through a function it invokes -- see doctor.mjs's header comment. This
+  // is a behavioral guarantee about doctor.mjs's call graph, not a claim
+  // that its *module* graph is free of these imports: as of C2, doctor.mjs
+  // imports local-config.mjs, which reuses the accepted, unmodified
+  // vendor/phase-b/lib/phase-b-launch-probe.mjs's resolvePinnedGeminiDistribution
+  // -- that vendor file itself imports node:child_process/node:http for its
+  // own unrelated exports doctor never calls. What this guard checks is
+  // narrower and still meaningful: doctor.mjs's own source never reaches
+  // around local-config.mjs to import from that vendor file directly.
   const forbiddenPatterns = [
     /from\s+['"]node:(child_process|net|http|https)['"]/,
     /require\(\s*['"]node:(child_process|net|http|https)['"]\s*\)/,
     /import\(\s*['"]node:(child_process|net|http|https)['"]\s*\)/,
     /\bfetch\s*\(/,
-    /phase-b-launch-probe/,
+    /from\s+['"][^'"]*phase-b-launch-probe(?:\.mjs)?['"]/,
+    /require\(\s*['"][^'"]*phase-b-launch-probe(?:\.mjs)?['"]\s*\)/,
+    /import\(\s*['"][^'"]*phase-b-launch-probe(?:\.mjs)?['"]\s*\)/,
   ];
   const doctorSrc = readFileSync(path.join(bundleRoot, 'lib', 'doctor.mjs'), 'utf8');
-  const runSrc = readFileSync(path.join(bundleRoot, 'lib', 'run.mjs'), 'utf8');
-  for (const [label, src] of [['doctor.mjs', doctorSrc], ['run.mjs', runSrc]]) {
-    for (const pattern of forbiddenPatterns) {
-      assert.ok(!pattern.test(src), `expected ${label} not to match ${pattern}`);
-    }
+  for (const pattern of forbiddenPatterns) {
+    assert.ok(!pattern.test(doctorSrc), `expected doctor.mjs not to match ${pattern}`);
   }
+});
+
+// Before C2, run.mjs had the same absolute "never touches network/process"
+// invariant as doctor.mjs. As of C2 that invariant is deliberately no longer
+// true of the bundle as a whole -- run.mjs may now, through
+// lib/local-gemini-runner.mjs, perform a bounded backend health check and
+// spawn the real pinned Gemini CLI once a valid local config exists. What
+// still holds, and is what this guard now checks, is layering: run.mjs's
+// *own* source never reaches for these primitives directly -- it only ever
+// delegates to local-config.mjs/local-gemini-runner.mjs, which own the
+// preflight/isolation/bounding logic those primitives require. This is an
+// architectural guard against a future edit accidentally duplicating (and
+// likely under-hardening) that logic ad hoc inside run.mjs, not a claim
+// that run.mjs's capabilities are unchanged from before C2.
+test('run.mjs source never directly imports network or process-spawn primitives itself (static layering guard)', () => {
+  const directPrimitivePatterns = [
+    /from\s+['"]node:(child_process|net|http|https)['"]/,
+    /require\(\s*['"]node:(child_process|net|http|https)['"]\s*\)/,
+    /import\(\s*['"]node:(child_process|net|http|https)['"]\s*\)/,
+    /\bfetch\s*\(/,
+  ];
+  const runSrc = readFileSync(path.join(bundleRoot, 'lib', 'run.mjs'), 'utf8');
+  for (const pattern of directPrimitivePatterns) {
+    assert.ok(!pattern.test(runSrc), `expected run.mjs not to match ${pattern}`);
+  }
+  // run.mjs must still go through the runner rather than reaching around it
+  // to call the bounded routing-proof probe directly.
+  assert.ok(
+    !/runPhaseBLaunchProbe/.test(runSrc),
+    'expected run.mjs not to reference runPhaseBLaunchProbe directly',
+  );
 });
 
 // --- cli.mjs (dispatch) ---------------------------------------------------
