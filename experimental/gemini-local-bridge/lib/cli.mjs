@@ -57,7 +57,7 @@ export async function main(argv, env = process.env, io = { stdout: process.stdou
     return 0;
   }
 
-  const result = attemptRun(argv, env);
-  io.stderr.write(result.message + '\n');
+  const result = await attemptRun(argv, env);
+  (result.ok ? io.stdout : io.stderr).write(result.message + '\n');
   return result.exitCode;
 }
