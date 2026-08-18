@@ -87,10 +87,12 @@ echo "install-gemini-local: installing for HOME=${HOME}"
 preflight_install_paths
 mkdir -p "${BIN_DIR}" "${DATA_DIR}" "${CONFIG_DIR}"
 
-# Replace the promoted payload atomically-ish: stage into a temp dir next to
-# the real target, then rename over it, so a failure mid-copy never leaves a
-# half-written vendor/lib tree in place.
-STAGE_DIR="$(mktemp -d "${DATA_DIR}.stage.XXXXXX")"
+# Replace the promoted payload atomically-ish: stage inside the already-
+# validated product-owned data directory, then rename the staged children into
+# place. This keeps every installer-created path beneath the documented owned
+# locations while still preventing a failure mid-copy from leaving half-written
+# vendor/lib trees in place.
+STAGE_DIR="$(mktemp -d "${DATA_DIR}/.stage.XXXXXX")"
 trap 'rm -rf "${STAGE_DIR}"' EXIT
 
 cp -R "${SCRIPT_DIR}/lib" "${STAGE_DIR}/lib"

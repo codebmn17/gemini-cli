@@ -171,3 +171,9 @@ test('Termux instructions require an out-of-band exact transport SHA and no mova
   assert.match(doc, /git rev-parse HEAD/);
   assert.doesNotMatch(doc, /git checkout claude\/termux-bridge-plan-review-ziqde5/);
 });
+
+test('installer stages only beneath the product-owned DATA_DIR, never as a sibling', () => {
+  const source = readFileSync(installScript, 'utf8');
+  assert.match(source, /mktemp -d "\$\{DATA_DIR\}\/\.stage\.XXXXXX"/);
+  assert.doesNotMatch(source, /mktemp -d "\$\{DATA_DIR\}\.stage\.XXXXXX"/);
+});
