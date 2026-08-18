@@ -40,12 +40,20 @@ import {
   cleanupPhaseBRuntime,
 } from '../vendor/phase-b/lib/phase-b-runtime.mjs';
 import { createAdapterServer } from './llama-cpp-adapter.mjs';
+import { validateBackendOrigin } from './loopback-origin.mjs';
+import {
+  LOCAL_CONFIG_SCHEMA_VERSION,
+  SUPPORTED_BACKEND,
+} from './local-config.mjs';
 
 export const DEFAULT_HEALTH_TIMEOUT_MS = 3_000;
+export const MAX_HEALTH_TIMEOUT_MS = 30_000;
+export const MAX_HEALTH_BODY_BYTES = 64 * 1024;
 export const DEFAULT_RUN_TIMEOUT_MS = 30_000;
 export const MAX_RUN_TIMEOUT_MS = 120_000;
 const TERMINATION_GRACE_MS = 2_000;
 const MAX_CAPTURE_BYTES = 1_000_000;
+const CLIENT_MODEL_RE = /^local(-[a-zA-Z0-9._-]+|\/[a-zA-Z0-9._/-]+)?$/;
 
 // Pinned Gemini CLI 0.55.1 flags (packages/cli/src/config/config.ts):
 // --model/-m (string), --prompt/-p (string, headless trigger),
@@ -70,26 +78,88 @@ function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function isPositiveSafeInteger(value, max) {
+  return Number.isSafeInteger(value) && value > 0 && value <= max;
+}
+
+function isSafeClientModel(value) {
+  return (
+    typeof value === 'string' &&
+    CLIENT_MODEL_RE.test(value) &&
+    !value.endsWith('flash')
+  );
+}
+
+async function readBoundedJsonResponse(response, maxBytes) {
+  const contentLength = response.headers?.get?.('content-length');
+  if (contentLength !== null && contentLength !== undefined) {
+    const parsedLength = Number(contentLength);
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) return null;
+  }
+
+  const reader = response.body?.getReader?.();
+  if (!reader) return null;
+
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The response is already being rejected as unhealthy.
+        }
+        return null;
+      }
+      chunks.push(chunk);
+    }
+  } catch {
+    return null;
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * GET <backendOrigin>/health, per the pinned llama.cpp server contract
  * (ggml-org/llama.cpp commit 0021a77de0a8966059dc94548fb3b96654e0bb12,
- * tools/server/README.md): 200 + {"status":"ok"} means ready; a 503 +
- * {"error":{...}} body means still loading; anything else (including a
- * network error, non-2xx, or malformed body) is treated as unhealthy.
- * Never throws -- callers decide what "not healthy" means for them.
+ * tools/server/server.cpp + server-context.cpp): literal-loopback only,
+ * 200 + {"status":"ok"} means ready; a loading/error response or anything
+ * malformed is unhealthy. The response body is byte-bounded before JSON
+ * parsing so even a broken local process cannot make this pre-launch probe
+ * buffer unbounded data. Never throws -- callers decide what "not healthy"
+ * means for them.
  */
-export async function checkBackendHealth(backendOrigin, { fetchImpl = fetch, timeoutMs = DEFAULT_HEALTH_TIMEOUT_MS } = {}) {
+export async function checkBackendHealth(
+  backendOrigin,
+  { fetchImpl = fetch, timeoutMs = DEFAULT_HEALTH_TIMEOUT_MS } = {},
+) {
+  try {
+    validateBackendOrigin(backendOrigin);
+  } catch {
+    return false;
+  }
+  if (!isPositiveSafeInteger(timeoutMs, MAX_HEALTH_TIMEOUT_MS)) return false;
+  if (typeof fetchImpl !== 'function') return false;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(`${backendOrigin}/health`, { method: 'GET', signal: controller.signal });
+    const res = await fetchImpl(`${backendOrigin}/health`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
     if (!res.ok) return false;
-    let json;
-    try {
-      json = await res.json();
-    } catch {
-      return false;
-    }
+    const json = await readBoundedJsonResponse(res, MAX_HEALTH_BODY_BYTES);
     return isPlainObject(json) && json.status === 'ok';
   } catch {
     return false;
@@ -157,7 +227,14 @@ async function terminateChild(child, exitPromise) {
   if (child.exitCode === null && child.signalCode === null) {
     child.kill('SIGKILL');
   }
-  return raceWithTimeout(exitPromise, TERMINATION_GRACE_MS);
+  result = await raceWithTimeout(exitPromise, TERMINATION_GRACE_MS);
+  if (result === null) {
+    fail(
+      'CHILD_TERMINATION_FAILED',
+      'Gemini child did not terminate after SIGKILL',
+    );
+  }
+  return result;
 }
 
 /**
@@ -180,9 +257,10 @@ function isSafePromptToken(token) {
  * with a launcher-owned argv -> parse its JSON output -> clean up
  * everything on every path (success, any failure, timeout).
  *
- * `config` must already be the object `local-config.mjs`'s
- * `validateLocalConfig`/`loadLocalConfig` returned -- this function does
- * not re-parse untrusted JSON.
+ * `config` is expected to be the normalized object returned by
+ * local-config.mjs. Critical network/model-identity invariants are checked
+ * again here as a second boundary so direct callers cannot turn this exported
+ * runner into an arbitrary-network or Gemini-model-rebranding path.
  */
 export async function runLocalGeminiPrompt({
   config,
@@ -196,14 +274,34 @@ export async function runLocalGeminiPrompt({
   if (!isPlainObject(config) || typeof config.geminiRoot !== 'string' || config.geminiRoot.length === 0) {
     fail('INVALID_CONFIG', 'runLocalGeminiPrompt requires an already-validated local config');
   }
+  if (
+    config.schemaVersion !== LOCAL_CONFIG_SCHEMA_VERSION ||
+    config.backend !== SUPPORTED_BACKEND ||
+    typeof config.backendModel !== 'string' ||
+    config.backendModel.length === 0 ||
+    !isSafeClientModel(config.clientModel)
+  ) {
+    fail('INVALID_CONFIG', 'local config failed the runner secondary invariant check');
+  }
+  try {
+    validateBackendOrigin(config.backendOrigin);
+  } catch {
+    fail('INVALID_CONFIG', 'local config backendOrigin is not literal loopback');
+  }
   if (!Array.isArray(promptArgv) || promptArgv.length === 0 || !promptArgv.every(isSafePromptToken)) {
     fail(
       'UNSUPPORTED_ARGV',
       'prompt must be one or more non-flag argv tokens; the launcher owns all Gemini CLI arguments and forwards no caller flags',
     );
   }
-  if (!Number.isSafeInteger(runTimeoutMs) || runTimeoutMs <= 0 || runTimeoutMs > MAX_RUN_TIMEOUT_MS) {
+  if (!isPositiveSafeInteger(runTimeoutMs, MAX_RUN_TIMEOUT_MS)) {
     fail('INVALID_CONFIG', `runTimeoutMs must be a positive integer <= ${MAX_RUN_TIMEOUT_MS}`);
+  }
+  if (!isPositiveSafeInteger(healthTimeoutMs, MAX_HEALTH_TIMEOUT_MS)) {
+    fail('INVALID_CONFIG', `healthTimeoutMs must be a positive integer <= ${MAX_HEALTH_TIMEOUT_MS}`);
+  }
+  if (typeof fetchImpl !== 'function') {
+    fail('INVALID_CONFIG', 'fetchImpl must be a function');
   }
   const prompt = promptArgv.join(' ');
 
@@ -216,7 +314,10 @@ export async function runLocalGeminiPrompt({
   // an unhealthy backend means there is nothing useful to isolate a runtime
   // or spawn a child for. This is a direct check of the real backend
   // origin, independent of the (not-yet-started) C1 adapter.
-  const healthy = await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: healthTimeoutMs });
+  const healthy = await checkBackendHealth(config.backendOrigin, {
+    fetchImpl,
+    timeoutMs: healthTimeoutMs,
+  });
   if (!healthy) {
     fail('BACKEND_UNHEALTHY', 'local backend failed its /health check; refusing to launch Gemini');
   }
