@@ -30,9 +30,12 @@ Android/Termux device. The exact executable/test tree validated on-device was
 `a1b59aea2b70a5699956b4fe66b435d4a8c320a0`. That validation covers the
 installer, integrity/doctor behavior, fail-closed prompt handling, the full
 56-test suite, default uninstall/config preservation, reinstall, purge, and
-preservation of the existing Gemini CLI. It does **not** validate future
-llama.cpp model inference or future adapter/process-launch behavior that is
-not wired into this skeleton yet.
+preservation of the existing Gemini CLI. Later commits only reconcile this
+README and `docs/TERMUX.md`; they do not change executable/test/vendor content.
+
+This acceptance does **not** validate future llama.cpp model inference or
+future adapter/process-launch behavior that is not wired into this skeleton
+yet.
 
 ## What this is not
 
@@ -99,7 +102,7 @@ cd experimental/gemini-local-bridge
 npm test
 ```
 
-The exact device-tested tree at
+The exact device-tested executable/test tree at
 `a1b59aea2b70a5699956b4fe66b435d4a8c320a0` passed **56/56** tests on real
 Android/Termux, with 0 failures/cancellations/skips/todo. All 20 applicable
 `.mjs` files passed `node --check`, and both installer/uninstaller scripts
