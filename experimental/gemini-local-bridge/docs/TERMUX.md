@@ -253,6 +253,13 @@ At the corrected exact tree `a1b59aea...`, real-device evidence was:
 **Accepted for the current skeleton/install lifecycle on this tested Termux
 device.**
 
+After this device run, documentation-only reconciliation updated this file
+and the bundle README. The final transport/documentation head therefore
+advances beyond `a1b59aea...`; the acceptance report must distinguish that
+final transport SHA from the exact executable/test tree above. No executable,
+test, installer, provenance, or vendored artifact was changed by that
+reconciliation.
+
 Still deferred / not claimed by this acceptance:
 
 - installation or configuration of a llama.cpp adapter
