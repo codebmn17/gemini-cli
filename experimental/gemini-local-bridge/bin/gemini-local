@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+/*
+ * gemini-local — installed to ~/.local/bin/gemini-local.
+ *
+ * This shim is deliberately CommonJS (no top-level import/export) so it
+ * runs correctly when invoked with no file extension via its shebang,
+ * regardless of Node version quirks around ESM auto-detection for
+ * extensionless files. It derives HOME at runtime (never a baked-in path)
+ * and dynamically imports the real ESM CLI from the data directory that
+ * install-gemini-local.sh populated.
+ */
+'use strict';
+
+const os = require('node:os');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+const home = process.env.HOME && process.env.HOME.length > 0 ? process.env.HOME : os.homedir();
+if (!home) {
+  process.stderr.write('gemini-local: unable to resolve HOME directory\n');
+  process.exit(2);
+}
+
+const cliEntry = path.join(home, '.local', 'share', 'gemini-local-bridge', 'lib', 'cli.mjs');
+
+import(pathToFileURL(cliEntry).href)
+  .then((mod) => mod.main(process.argv.slice(2)))
+  .then((exitCode) => {
+    process.exit(typeof exitCode === 'number' ? exitCode : 0);
+  })
+  .catch((error) => {
+    if (error && error.code === 'ERR_MODULE_NOT_FOUND') {
+      process.stderr.write(
+        `gemini-local: bridge library not found at ${cliEntry}\n` +
+          'Was install-gemini-local.sh run for this HOME? Try re-running the installer.\n',
+      );
+      process.exit(2);
+    }
+    process.stderr.write(`gemini-local: fatal: ${(error && error.message) || error}\n`);
+    process.exit(1);
+  });
