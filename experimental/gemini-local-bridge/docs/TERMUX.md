@@ -44,16 +44,34 @@ Only continue to step 2 once you have confirmed `git` and `node` (with
 `node --test` support, i.e. Node 18+) are already present, or their
 installation has been separately authorized and completed.
 
-## 2. Get this bundle onto the device
+## 2. Get the exact reviewed transport commit onto the device
+
+Do **not** install from a movable branch name. Obtain the exact 40-character
+PR #7 transport SHA from the independent acceptance report/handoff, paste it
+below, and check out that commit detached. The placeholder is intentionally
+not a valid SHA so an unedited copy-paste cannot proceed accidentally.
 
 ```sh
+TRANSPORT_SHA='<EXACT_REVIEWED_PR7_SHA>'
+
 cd ~
-git clone https://github.com/codebmn17/gemini-cli.git
+git clone --no-checkout https://github.com/codebmn17/gemini-cli.git
 cd gemini-cli
-git checkout claude/termux-bridge-plan-review-ziqde5
-git log -1 --format='%H'   # confirm this matches the commit you were told to expect
+git fetch origin "$TRANSPORT_SHA"
+git checkout --detach "$TRANSPORT_SHA"
+ACTUAL_SHA="$(git rev-parse HEAD)"
+printf 'expected transport SHA: %s\n' "$TRANSPORT_SHA"
+printf 'actual transport SHA:   %s\n' "$ACTUAL_SHA"
+[ "$ACTUAL_SHA" = "$TRANSPORT_SHA" ] || {
+  echo 'STOP: checked-out transport SHA does not match the independently accepted SHA.' >&2
+  exit 3
+}
 cd experimental/gemini-local-bridge
 ```
+
+If `git fetch origin "$TRANSPORT_SHA"` cannot obtain that exact commit,
+**stop and report it**. Do not substitute the PR branch, `main`, or another
+nearby SHA just to continue.
 
 ## 3. Install
 
@@ -61,14 +79,17 @@ cd experimental/gemini-local-bridge
 bash install-gemini-local.sh
 ```
 
-This writes only to:
+This writes only below the product-owned locations:
 
 - `~/.local/bin/gemini-local`
 - `~/.local/share/gemini-local-bridge/`
 - `~/.config/gemini-local-bridge/`
 
-It does not touch any existing `gemini` binary, any globally installed
-`@google/gemini-cli` npm package, or any path under Termux's `$PREFIX`.
+The installer treats `HOME` as the trusted boundary and fails closed if an
+existing path component beneath it that leads to one of those owned targets
+is a symlink or an unexpected filesystem object. It does not touch any
+existing `gemini` binary, any globally installed `@google/gemini-cli` npm
+package, or any path under Termux's `$PREFIX`.
 
 ## 4. Put the launcher on PATH
 
@@ -129,6 +150,10 @@ bash uninstall-gemini-local.sh          # keeps ~/.config/gemini-local-bridge/
 bash uninstall-gemini-local.sh --purge  # also removes ~/.config/gemini-local-bridge/
 ```
 
+Uninstall performs its complete path-safety preflight before its first
+chmod/remove operation. If an owned target or relevant ancestor is unsafe,
+it fails closed without deliberately beginning a partial uninstall.
+
 ## Host-side validation vs. NOT TESTED
 
 Validated on the Linux host that built this bundle:
@@ -143,6 +168,8 @@ Validated on the Linux host that built this bundle:
   `node:net`, `node:http(s)`, or call `fetch`
 - the installer/uninstaller never reference `npm`, a hardcoded Termux
   package path, or the real `gemini`/`@google/gemini-cli` install location
+- host-side regressions for ancestor-symlink refusal and uninstall complete
+  preflight-before-destruction behavior
 
 Explicitly **NOT TESTED** — only verifiable by running the commands above
 on a real device, not assumed to work:
