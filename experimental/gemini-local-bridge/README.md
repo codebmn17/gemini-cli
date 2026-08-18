@@ -13,17 +13,20 @@ remains untouched and unmerged.
 
 ## What this is
 
-`gemini-local` is meant to become a launcher that runs the official Gemini
-CLI as a host and routes inference to a local backend (first target:
-llama.cpp on Termux) instead of hosted Gemini. **This bundle does not do
-that yet.** At this skeleton stage:
+`gemini-local` is a launcher that runs the official Gemini CLI as a host and
+routes inference to a local backend (first target: llama.cpp on Termux)
+instead of hosted Gemini.
 
 - `gemini-local doctor` (alias `status`) runs filesystem/integrity checks
   only — no model inference, no network request.
-- Any other invocation, including an arbitrary prompt, **fails closed**:
-  non-zero exit, clear message, and it never falls back to hosted Gemini.
-- The llama.cpp adapter is not installed or wired up in this slice, so
-  `doctor` is expected to report `NOT READY`.
+- A prompt (`gemini-local "hello"`) launches the real chain **only** once a
+  valid local config exists (see Phase C2, below) — until then, or if the
+  config is missing/invalid, it **fails closed**: non-zero exit, clear
+  message, and it never falls back to hosted Gemini, exactly as at the
+  skeleton stage.
+- Nothing here installs or configures llama.cpp itself, or downloads a GGUF
+  model; a real backend at the configured `backendOrigin` remains the
+  operator's own responsibility.
 
 The current skeleton/install lifecycle has been validated on a real
 Android/Termux device. The exact executable/test tree validated on-device was
@@ -39,10 +42,14 @@ yet.
 
 ## What this is not
 
-- Not a working local-inference backend yet. Real llama.cpp adapter/model
-  inference remains deferred even though the current skeleton/install
-  lifecycle is Termux-validated. See [`docs/TERMUX.md`](docs/TERMUX.md) for
-  the exact device evidence and the remaining deferred scope.
+- Not a working local-inference backend yet. `gemini-local` does not
+  install llama.cpp or select/download a GGUF model itself — it can drive
+  the real pinned Gemini CLI through the protocol adapter to *some* already-
+  running llama.cpp-compatible backend the operator points it at (Phase C2),
+  but that backend's existence remains entirely outside this bundle's scope,
+  and none of this has been exercised on Termux. See
+  [`docs/TERMUX.md`](docs/TERMUX.md) for the exact device evidence and the
+  remaining deferred scope.
 - Not a modification to the real `gemini` executable or the globally
   installed `@google/gemini-cli` npm package. The installer only ever
   writes to `~/.local/bin/gemini-local`,
@@ -57,11 +64,14 @@ gemini-local-bridge/
   bin/gemini-local              installed launcher shim (CommonJS; dynamically
                                  imports lib/cli.mjs so it runs correctly with
                                  no file extension via its shebang)
-  lib/                           gemini-local's own logic (paths, integrity,
-                                 doctor, fail-closed run path, CLI dispatch,
-                                 and — as of Phase C1 — the Gemini<->llama.cpp
-                                 protocol-adapter core; see the Phase C1
-                                 section below. Not wired into the CLI yet.)
+  lib/                           gemini-local's own logic: paths, integrity,
+                                 doctor, CLI dispatch, the Gemini<->llama.cpp
+                                 protocol-adapter core (Phase C1), and the C2
+                                 local config + real launch orchestration
+                                 (local-config.mjs, local-gemini-runner.mjs);
+                                 run.mjs launches the real chain only once a
+                                 valid local config exists — see the Phase C1
+                                 and Phase C2 sections below.
   vendor/phase-b/                immutable, byte-for-byte promoted copies of
                                  the accepted Phase B lib/bin files + package.json
                                  (test/ files are intentionally excluded — dev/CI
@@ -119,10 +129,12 @@ The original Phase C1 author head `8e99448a87b0caa56017bc95df13ba5057066551`
 added 38 tests and passed **94/94** on its Linux host. Independent review then
 found bounded C1 defects in real llama.cpp usage-chunk handling, listener
 binding enforcement, streaming timeout coverage, backend response bounding,
-and closed-world request/query parsing. Those fixes add 10 further hardening
-regressions. **The complete suite must be rerun at the current PR head before
-a new aggregate pass count is claimed.** C1 has not been run on Termux/a
-device.
+and closed-world request/query parsing. Those fixes added 10 further
+hardening regressions (`test/c1-hardening.test.mjs`), re-validated at the
+accepted C1 head `b3e2e7066853e1fa1e69279ef1793907772625af`: **104/104**.
+Phase C2 (below) adds real-launch capability behind a local config file and
+its own dedicated tests; see that section for current totals. Neither C1 nor
+C2 has been run on Termux/a device — Linux-host validation only.
 
 ## Phase C1: local protocol-adapter core (host-only, not wired in)
 
@@ -130,12 +142,11 @@ Adds `lib/gemini-protocol.mjs`, `lib/llama-protocol.mjs`, and
 `lib/llama-cpp-adapter.mjs`: a **protocol compatibility layer** between the
 official Gemini CLI host and a llama.cpp-compatible local backend. This
 slice does **not** install llama.cpp, does **not** download or select a
-GGUF model, does **not** launch the real Gemini CLI, does **not** change
-`run.mjs` (arbitrary prompts still fail closed — `gemini-local "hello"`
-still refuses, exactly as before), and **has not been run on a Termux
-device**. The original C1 author head was tested on Linux against a fake
-loopback llama.cpp-compatible server; the current hardening head still
-requires its final complete host rerun.
+GGUF model, and does **not** launch the real Gemini CLI — it is a
+self-contained protocol translator, exercised only by its own test suite
+against a fake loopback llama.cpp-compatible server and, from C1 itself, not
+wired into `run.mjs` at all (that wiring is Phase C2, below). **Has not been
+run on a Termux device** — Linux-host validation only.
 
 ### Architecture
 
@@ -204,8 +215,184 @@ node --test test/llama-cpp-adapter.test.mjs   # 38/38
 npm test                                      # 94/94 total
 ```
 
-Independent hardening adds `test/c1-hardening.test.mjs` with 10 focused
-regressions. A local isolated harness executed those 10 hardening regressions
-successfully after the correction, and the replacement `.mjs` files passed
-`node --check`; that harness is not a substitute for the required complete
-repository-host rerun at the exact current PR head.
+Independent hardening added `test/c1-hardening.test.mjs` (10 focused
+regressions for real llama.cpp usage-chunk handling, listener binding
+enforcement, streaming timeout coverage, backend response bounding, and
+closed-world request/query parsing) and was re-validated at the accepted C1
+head `b3e2e7066853e1fa1e69279ef1793907772625af`:
+
+```sh
+node --test test/llama-cpp-adapter.test.mjs   # 38/38
+node --test test/c1-hardening.test.mjs        # 10/10
+npm test                                      # 104/104 total
+```
+
+C1 was not run on a Termux/Android device; Linux-host validation only.
+
+## Phase C2: the real host chain (config-gated, host-only)
+
+Proves and implements the real chain: the official, pinned Gemini CLI
+0.55.1, launched by `gemini-local` itself, talking through the C1 adapter to
+a local llama.cpp-compatible backend. This is the first slice that can
+launch the real Gemini CLI — but only once a local config file exists and
+validates; without one, `gemini-local "hello"` still fails exactly as
+before, with the same message and exit code.
+
+Adds `lib/local-config.mjs` (schema/validation), `lib/local-gemini-runner.mjs`
+(the launch orchestration), and `lib/loopback-origin.mjs` (the
+loopback-origin format shared by the C1 adapter and the C2 config, extracted
+out of `llama-cpp-adapter.mjs` so `lib/local-config.mjs` — and therefore
+`doctor.mjs`, which reuses it — never needs that file's own `node:http`
+listener code just to validate a string). Rewrites `lib/run.mjs` and extends
+`lib/doctor.mjs`.
+
+Still does **not**: install llama.cpp, download or select a GGUF model,
+touch a Termux device, add tool execution, forward arbitrary caller argv to
+the real Gemini CLI, or support interactive/slash-command mode. Still
+**never** falls back to hosted Gemini on any failure.
+
+### Local config
+
+`~/.config/gemini-local-bridge/llama-cpp-adapter.json` (path unchanged from
+the C1-era skeleton placeholder it promotes — see `lib/paths.mjs`) is the
+single file that turns `gemini-local` from "always fails closed" into
+"launches the real pinned Gemini CLI against a local backend". Exactly six
+keys, closed-world (`lib/local-config.mjs`):
+
+```json
+{
+  "schemaVersion": 1,
+  "backend": "llama.cpp",
+  "backendOrigin": "http://127.0.0.1:<port>",
+  "backendModel": "<actual local model id, sent to the backend>",
+  "clientModel": "local | local-<id> | local/<id> (sent to Gemini CLI)",
+  "geminiRoot": "/path/to/a verified @google/gemini-cli 0.55.1 install"
+}
+```
+
+Loading is a bounded, no-follow, regular-file-only read; `backendOrigin`
+reuses the C1 loopback validator, `geminiRoot` reuses the accepted Phase-B
+pinned-distribution verifier unmodified, and `clientModel` is checked
+against a neutral-only pattern that also rejects any value ending in
+`"flash"` — pinned Gemini CLI's own model resolution treats any such string
+as flash-family and may rebrand it internally, so a `"local-flash"`-style
+value is rejected even though it matches the neutral prefix. There is no
+credential field in this schema, and the exact-key-set check rejects
+anything else — there is nowhere to put one even by accident. A missing or
+invalid config is reported by `doctor` as informational (expected /
+recoverable), never as package corruption.
+
+### What actually launches, and how
+
+Once a valid config is loaded, `gemini-local <prompt text>` (`lib/run.mjs`)
+runs the full chain (`lib/local-gemini-runner.mjs`): Phase-B preflight, a
+bounded backend `/health` check (never launches Gemini against an unhealthy
+backend), fresh re-verification of the pinned Gemini distribution, starting
+the C1 adapter on an ephemeral `127.0.0.1` port, materializing an isolated
+Phase-B runtime pointed at that adapter (reusing every accepted primitive —
+`runPhaseBPreflight`, `resolvePinnedGeminiDistribution`,
+`reverifyPinnedEntrypoint`, `buildLaunchContract`,
+`verifyNoPinnedGeminiEnvSource`, `materializePhaseBRuntime`,
+`verifyPhaseBRuntime`, `cleanupPhaseBRuntime` — in the same order the
+accepted PR #6 routing probe uses them, none modified), spawning the real
+pinned `gemini` entrypoint with a launcher-owned argv
+(`--model <clientModel> --prompt <text> --output-format json`, never a
+caller-supplied flag), and parsing its `JsonFormatter`-shaped JSON stdout.
+Every path — success, timeout, crash, bad output — cleans up the adapter,
+the child, and the isolated runtime directory.
+
+The launch contract also forces `tools.core: []` in the isolated system
+settings (on top of the accepted `tools.allowed: []`, which only bypasses
+the confirmation dialog and does not by itself empty the tool registry) —
+without it, pinned Gemini CLI registers its full built-in tool set
+regardless, and would declare real tool/function capability to the model
+that this build has no way to honor.
+
+`gemini-local`'s own argv is intentionally narrow: any token starting with
+`-`, or no tokens at all, fails closed (interactive mode and slash commands
+are not supported yet) — `gemini-local` owns every argument the real Gemini
+CLI process receives; nothing from the caller's argv is ever forwarded as a
+separate argv entry.
+
+### Two real-execution findings
+
+Building this slice meant, for the first time, actually completing a
+request/response round trip through the real pinned Gemini CLI — which
+surfaced two real incompatibilities no synthetic C1 unit test could have:
+
+1. **`tools`**: pinned `Client.startChat()`/`setTools()`
+   (`packages/core/src/core/client.ts`) unconditionally sends
+   `tools: [{ functionDeclarations: [...] }]` on every request, headless
+   prompts included — there is no code path that omits it. C1's original
+   check rejected the key's mere presence. `lib/gemini-protocol.mjs` now
+   accepts only the exact harmless-empty shape (`functionDeclarations`
+   absent or `[]`, no other key on any entry) that config's `tools.core: []`
+   makes possible — a request offering any real function declaration, or
+   any other `Tool` variant, still fails closed exactly as before.
+2. **`generationConfig.thinkingConfig`**: any `clientModel` string pinned
+   Gemini CLI doesn't recognize as a real Gemini model — which is every
+   `clientModel` this bridge ever sends, by design — falls back to its
+   `chat-base` model-config alias, which sets
+   `thinkingConfig: { includeThoughts: true }` with no budget/level.
+   `lib/gemini-protocol.mjs` now accepts only that exact default shape; a
+   request with `thinkingBudget`, `thinkingLevel`, or any other key still
+   fails closed exactly as before.
+
+Both are narrow, evidence-derived relaxations of a presence check into a
+content check, preserving the original "never silently drop a real
+capability" invariant — not a loosening of what capability is actually
+supported.
+
+### Doctor
+
+`gemini-local doctor` remains **filesystem-only** — loading the C2 config
+(`loadLocalConfig`) is itself filesystem-only (a bounded read, `JSON.parse`,
+and two equally filesystem-only checks), so doctor calling it does not
+compromise that invariant; doctor's own source still never imports a
+network/process-spawn primitive directly, or reaches around
+`local-config.mjs` to import the pinned-distribution verifier itself (both
+are enforced by static regression guards in `test/cli.test.mjs`). Doctor
+reports whether a local config is present and valid (`local.configured`,
+`local.host`, `local.backend`, `local.backendOrigin`, `local.clientModel`,
+`local.backendModel`) but **never** whether the backend is actually
+reachable — `local.backendHealth` is always the fixed string
+`"not probed by doctor"`, and `hostedFallback` is always `"disabled"`.
+`localInferenceReady` changed meaning from C1 (marker-file presence only,
+while every prompt still unconditionally failed closed regardless) to "a
+schema-valid config exists and a real launch will be attempted" —
+`schemaVersion` in doctor's report is bumped to `3` to signal this.
+
+### Testing
+
+Two dedicated files. `test/local-config.test.mjs` covers config schema
+validation only (no spawn, no network — a fake, manifest-valid distribution
+stand-in, never the real pinned build). `test/c2-local-run.test.mjs` covers
+the runner's orchestration and `run.mjs`/`cli.mjs`'s dispatch against a fake
+"Gemini CLI" stand-in process (spawned for real, but a tiny script rather
+than the real ~150MB+ pinned build) that itself makes a real request through
+the real C1 adapter to a fake backend — proving health-check gating,
+clientModel/backendModel separation, credential non-forwarding, cleanup on
+every path (success, timeout, crash, bad output), and no-hosted-fallback —
+plus exactly one test that is not mocked at all.
+
+That one test — the real pinned Gemini CLI 0.55.1 completing a prompt
+through the real C1 adapter to a fake backend — is gated behind the
+`GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT` environment variable, since the real
+build is a large, freshly-built artifact this repository cannot commit and
+a generic CI checkout will not have on disk. Without that variable set it
+SKIPS itself with a clear reason rather than silently passing; **it was run
+for real during this feature's own development**, pointed at a verified
+checkout+build of commit `41327e407da58aa01c409ef6685b7b5d379f295e`
+(`package.json` version `0.55.1`):
+
+```sh
+node --test test/local-config.test.mjs     # 21/21
+node --test test/c2-local-run.test.mjs     # 20/20 + 1 skipped by default
+GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT=<real pinned checkout> \
+  node --test test/c2-local-run.test.mjs   # 21/21 (real Gemini CLI test included)
+npm test                                   # 146/146 + 1 skipped by default (147/147 with the variable set)
+```
+
+C1's own 104 tests are unchanged and still pass; C2 does not weaken or
+bypass any C1 request/response validation. Neither C1 nor C2 has been run
+on a Termux/Android device — Linux-host validation only.
