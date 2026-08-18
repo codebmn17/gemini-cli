@@ -25,12 +25,21 @@ that yet.** At this skeleton stage:
 - The llama.cpp adapter is not installed or wired up in this slice, so
   `doctor` is expected to report `NOT READY`.
 
+The current skeleton/install lifecycle has been validated on a real
+Android/Termux device. The exact executable/test tree validated on-device was
+`a1b59aea2b70a5699956b4fe66b435d4a8c320a0`. That validation covers the
+installer, integrity/doctor behavior, fail-closed prompt handling, the full
+56-test suite, default uninstall/config preservation, reinstall, purge, and
+preservation of the existing Gemini CLI. It does **not** validate future
+llama.cpp model inference or future adapter/process-launch behavior that is
+not wired into this skeleton yet.
+
 ## What this is not
 
-- Not a Termux build or Termux validation. Everything in this bundle was
-  built and tested on a Linux host. See [`docs/TERMUX.md`](docs/TERMUX.md)
-  for the exact commands to run on-device, and its explicit list of what
-  remains unverified until someone does.
+- Not a working local-inference backend yet. Real llama.cpp adapter/model
+  inference remains deferred even though the current skeleton/install
+  lifecycle is Termux-validated. See [`docs/TERMUX.md`](docs/TERMUX.md) for
+  the exact device evidence and the remaining deferred scope.
 - Not a modification to the real `gemini` executable or the globally
   installed `@google/gemini-cli` npm package. The installer only ever
   writes to `~/.local/bin/gemini-local`,
@@ -56,11 +65,11 @@ gemini-local-bridge/
   tools/generate-provenance.mjs  regenerates PROVENANCE.json from vendor/ on disk
   install-gemini-local.sh
   uninstall-gemini-local.sh
-  test/                          node:test suite (55 tests, run on this Linux host)
-  docs/TERMUX.md                 exact copy-paste Termux commands + NOT-TESTED list
+  test/                          node:test suite (56 tests at device acceptance)
+  docs/TERMUX.md                 reproducible Termux procedure + accepted/deferred scope
 ```
 
-## Quick start (Linux host)
+## Quick start
 
 ```sh
 cd experimental/gemini-local-bridge
@@ -69,16 +78,19 @@ export PATH="$HOME/.local/bin:$PATH"   # only for this shell; installer does not
 gemini-local doctor
 ```
 
-For Termux, see [`docs/TERMUX.md`](docs/TERMUX.md).
+For the exact Termux validation procedure and evidence, see
+[`docs/TERMUX.md`](docs/TERMUX.md).
 
 ## Integrity
 
 `gemini-local doctor` recomputes SHA-256 for every vendored file against
-`PROVENANCE.json` on every run. The installer also marks the vendored
-payload read-only (`0444`) after copying it in. A reinstall
-(`bash install-gemini-local.sh` again) always replaces the payload with a
-fresh copy from this bundle, so tampering or corruption is both detectable
-(`doctor`) and recoverable (reinstall).
+`PROVENANCE.json` on every run. The installer applies each promoted file's
+manifest-declared installed mode (`0555` for promoted executable launchers,
+`0444` for promoted libraries/package metadata) while keeping containing
+vendor directories owner-writable so normal non-root reinstall/uninstall
+works on Termux. A reinstall (`bash install-gemini-local.sh` again) replaces
+the payload with a fresh copy from this bundle, so tampering or corruption
+is both detectable (`doctor`) and recoverable (reinstall).
 
 ## Testing
 
@@ -87,10 +99,12 @@ cd experimental/gemini-local-bridge
 npm test
 ```
 
-55/55 tests passing on this Linux host as of the final host-validation run, covering:
-path resolution, provenance/integrity verification (clean, tampered,
-missing-file cases), `doctor` behavior (including proof it never calls
-`fetch`, plus a static source check that it never imports
-`node:child_process`/`node:net`/`node:http(s)`), fail-closed prompt
-handling, CLI dispatch, and full install/reinstall/uninstall/`--purge`
-end-to-end behavior including PATH and read-only-permission checks.
+The exact device-tested tree at
+`a1b59aea2b70a5699956b4fe66b435d4a8c320a0` passed **56/56** tests on real
+Android/Termux, with 0 failures/cancellations/skips/todo. All 20 applicable
+`.mjs` files passed `node --check`, and both installer/uninstaller scripts
+passed `bash -n`. The suite covers path resolution, provenance/integrity
+verification (clean, tampered, missing-file cases), `doctor` behavior,
+fail-closed prompt handling, CLI dispatch, path-safety boundaries, non-root
+Termux directory permissions, and full install/reinstall/uninstall/`--purge`
+end-to-end behavior.
