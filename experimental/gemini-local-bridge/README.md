@@ -364,7 +364,7 @@ schema-valid config exists and a real launch will be attempted" —
 
 ### Testing
 
-Two dedicated files. `test/local-config.test.mjs` covers config schema
+Three dedicated files. `test/local-config.test.mjs` covers config schema
 validation only (no spawn, no network — a fake, manifest-valid distribution
 stand-in, never the real pinned build). `test/c2-local-run.test.mjs` covers
 the runner's orchestration and `run.mjs`/`cli.mjs`'s dispatch against a fake
@@ -373,17 +373,20 @@ than the real ~150MB+ pinned build) that itself makes a real request through
 the real C1 adapter to a fake backend — proving health-check gating,
 clientModel/backendModel separation, credential non-forwarding, cleanup on
 every path (success, timeout, crash, bad output), and no-hosted-fallback —
-plus exactly one test that is not mocked at all.
+plus exactly one test that is not mocked at all. `test/c2-review-hardening.test.mjs`
+covers the independent-review findings below.
 
-That one test — the real pinned Gemini CLI 0.55.1 completing a prompt
-through the real C1 adapter to a fake backend — is gated behind the
+That one non-mocked test — the real pinned Gemini CLI 0.55.1 completing a
+prompt through the real C1 adapter to a fake backend — is gated behind the
 `GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT` environment variable, since the real
 build is a large, freshly-built artifact this repository cannot commit and
 a generic CI checkout will not have on disk. Without that variable set it
 SKIPS itself with a clear reason rather than silently passing; **it was run
-for real during this feature's own development**, pointed at a verified
-checkout+build of commit `41327e407da58aa01c409ef6685b7b5d379f295e`
-(`package.json` version `0.55.1`):
+for real, at both heads below**, pointed at a verified checkout+build of
+commit `41327e407da58aa01c409ef6685b7b5d379f295e` (`package.json` version
+`0.55.1`).
+
+Initial author head `3269934697d6f0e4d2ed1f5b214709dcf6689476`:
 
 ```sh
 node --test test/local-config.test.mjs     # 21/21
@@ -392,6 +395,53 @@ GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT=<real pinned checkout> \
   node --test test/c2-local-run.test.mjs   # 21/21 (real Gemini CLI test included)
 npm test                                   # 146/146 + 1 skipped by default (147/147 with the variable set)
 ```
+
+#### Independent C2 review and hardening
+
+Independent review of that head found and fixed 4 bounded defects before C2
+acceptance:
+
+1. `local-config.mjs`'s config read documented a no-follow discipline it
+   didn't actually enforce at the syscall level (`openSync(path, 'r')`
+   follows a symlink raced in after `lstat`) — the post-open dev/ino check
+   happened to still catch a symlink-swap in practice, but nothing stopped
+   a raced-in FIFO from hanging the process open with no writer. Fixed with
+   `O_NOFOLLOW | O_NONBLOCK` at open time.
+2. `checkBackendHealth()` trusted its `backendOrigin` argument and buffered
+   an unbounded response body via `res.json()`. It now validates literal
+   loopback before ever calling `fetch`, bounds its timeout, and byte-bounds
+   the response (64 KiB) before parsing.
+3. `runLocalGeminiPrompt()` trusted its `config` argument beyond one weak
+   shape check, so a caller bypassing `local-config.mjs` entirely could have
+   turned the exported runner into an arbitrary-network or
+   Gemini-model-rebranding path. It now re-checks schema/backend/model/origin
+   invariants itself as a second boundary.
+4. If SIGTERM and SIGKILL both failed to terminate the Gemini child, the
+   runner silently returned rather than surfacing that. It now raises
+   `CHILD_TERMINATION_FAILED`.
+
+Plus a documentation-only fix: the built-in `gemini-local help` text still
+described the pre-C2 skeleton ("FAILS CLOSED: no local backend installed
+yet"); it now describes the config-gated real-launch path.
+
+`test/c2-review-hardening.test.mjs` adds 7 focused regressions. Re-validated
+at the accepted current head `0034a7fe1d9cfc9e1492bcb595b03013b07a2374`:
+
+```sh
+node --test test/llama-cpp-adapter.test.mjs      # 38/38
+node --test test/c1-hardening.test.mjs           # 10/10
+node --test test/local-config.test.mjs           # 21/21
+node --test test/c2-local-run.test.mjs           # 20/20 + 1 skipped by default
+node --test test/c2-review-hardening.test.mjs    # 7/7
+npm test                                         # 153/153 + 1 skipped by default
+GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT=<real pinned checkout> \
+  node --test test/c2-local-run.test.mjs         # 21/21 (real Gemini CLI test included)
+GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT=<real pinned checkout> npm test   # 154/154
+```
+
+`.mjs` syntax: 31/31. Installer/uninstaller `bash -n`: both pass.
+`vendor/phase-b/` and `PROVENANCE.json`: git-confirmed byte-identical to the
+`product/gemini-local-v1` base, unchanged by either C2 head.
 
 C1's own 104 tests are unchanged and still pass; C2 does not weaken or
 bypass any C1 request/response validation. Neither C1 nor C2 has been run
