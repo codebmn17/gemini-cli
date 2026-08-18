@@ -29,7 +29,14 @@
  * accident.
  */
 
-import { lstatSync, openSync, closeSync, fstatSync, readSync } from 'node:fs';
+import {
+  constants as fsConstants,
+  lstatSync,
+  openSync,
+  closeSync,
+  fstatSync,
+  readSync,
+} from 'node:fs';
 import { validateBackendOrigin } from './loopback-origin.mjs';
 import { resolvePinnedGeminiDistribution } from '../vendor/phase-b/lib/phase-b-launch-probe.mjs';
 
@@ -60,12 +67,12 @@ function fail(reason) {
 }
 
 /**
- * Reads a config file with the same no-follow, bounded, single-descriptor
- * discipline used elsewhere in this bundle (see phase-b-launch-probe.mjs's
- * manifest read and integrity.mjs's lstat-first pattern): lstat first so a
- * symlink is rejected before anything opens it, then read through one held
- * file descriptor so the file that gets stat-checked is exactly the file
- * that gets read.
+ * Reads a config file with a bounded, held-descriptor, no-follow discipline.
+ * lstat rejects an already-present symlink, then O_NOFOLLOW closes the race
+ * where the path could otherwise be swapped to a symlink before open().
+ * O_NONBLOCK prevents a raced-in FIFO/device-like object from hanging the
+ * process at open time; fstat then requires the opened object to be the same
+ * regular-file inode observed by lstat before any bytes are consumed.
  */
 function readRegularFileNoFollow(targetPath, maxBytes) {
   let lstat;
@@ -85,10 +92,21 @@ function readRegularFileNoFollow(targetPath, maxBytes) {
     fail(`local config exceeds bounded size limit (${lstat.size} > ${maxBytes} bytes)`);
   }
 
-  const fd = openSync(targetPath, 'r');
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  const nonBlock = fsConstants.O_NONBLOCK ?? 0;
+  let fd;
+  try {
+    fd = openSync(targetPath, fsConstants.O_RDONLY | noFollow | nonBlock);
+  } catch (error) {
+    if (error?.code === 'ELOOP') {
+      fail(`local config must not be a symlink: ${targetPath}`);
+    }
+    fail(`unable to open local config safely: ${targetPath}`);
+  }
+
   try {
     const openStat = fstatSync(fd);
-    if (openStat.isSymbolicLink() || !openStat.isFile()) {
+    if (!openStat.isFile()) {
       fail('local config changed type between lstat and open');
     }
     if (openStat.dev !== lstat.dev || openStat.ino !== lstat.ino) {
