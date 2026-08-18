@@ -71,6 +71,62 @@ const UNSUPPORTED_TOP_LEVEL_FIELDS = Object.freeze([
   'cachedContent',
 ]);
 
+/**
+ * Pinned Gemini CLI 0.55.1's Client.startChat()/setTools()
+ * (packages/core/src/core/client.ts) unconditionally builds
+ * `tools: [{ functionDeclarations: toolRegistry.getFunctionDeclarations() }]`
+ * for every chat session, including headless single-prompt mode -- there is
+ * no code path that omits the `tools` key. `toolRegistry.getFunctionDeclarations()`
+ * is empty only when the isolated launch settings restrict the built-in
+ * tool allowlist to nothing (`tools.core: []` in settings.json ->
+ * `Config.getCoreTools()` -> `createToolRegistry()`'s `maybeRegister()`
+ * treats an empty allowlist as "enable none" for every core tool --
+ * packages/core/src/config/config.ts). When that holds, the `tools` field
+ * the real CLI sends is a syntactically-present but semantically-empty
+ * wrapper: nothing is being offered to the model, so nothing is lost by
+ * accepting it. This is deliberately narrower than "ignore tools": any
+ * entry that carries a real function declaration, or any other Tool
+ * variant (googleSearch/codeExecution/urlContext/retrieval/...), still
+ * fails closed exactly as before -- see isHarmlessEmptyToolsWrapper below.
+ */
+function isHarmlessEmptyToolsWrapper(tools) {
+  if (!Array.isArray(tools)) return false;
+  return tools.every((entry) => {
+    if (!isPlainObject(entry)) return false;
+    const keys = Object.keys(entry);
+    if (keys.some((key) => key !== 'functionDeclarations')) return false;
+    if (!('functionDeclarations' in entry)) return true;
+    const declarations = entry.functionDeclarations;
+    return Array.isArray(declarations) && declarations.length === 0;
+  });
+}
+
+/**
+ * Pinned Gemini CLI 0.55.1's ModelConfigService falls back to its
+ * `chat-base` alias for any model string it does not recognize as a real
+ * Gemini model (packages/core/src/services/modelConfigService.ts's
+ * `fallbackAlias = 'chat-base'` path) -- which is exactly what happens for
+ * every neutral/local clientModel this bridge ever sends, by design (it
+ * must never be a Gemini-branded name). `chat-base`
+ * (packages/core/src/config/defaultModelConfigs.ts) sets
+ * `generateContentConfig.thinkingConfig = { includeThoughts: true }` with no
+ * budget/level -- so, like the `tools` wrapper above, every real headless
+ * invocation carries this exact field whether or not "thinking" is actually
+ * wanted. `includeThoughts` only asks that thought parts be included *if the
+ * model produces any*; a backend/model with no thinking capability produces
+ * none either way, so the translated response already looks exactly like a
+ * real non-thinking Gemini model's would. Accepting only this precise
+ * default shape costs nothing; a real, deliberate ask -- `thinkingBudget`,
+ * `thinkingLevel`, or any other key -- still fails closed exactly as before.
+ */
+function isHarmlessDefaultThinkingConfig(thinkingConfig) {
+  if (!isPlainObject(thinkingConfig)) return false;
+  const keys = Object.keys(thinkingConfig);
+  if (keys.some((key) => key !== 'includeThoughts')) return false;
+  if (!('includeThoughts' in thinkingConfig)) return true;
+  return typeof thinkingConfig.includeThoughts === 'boolean';
+}
+
 // generationConfig fields with no faithful llama.cpp-side equivalent for
 // C1 (non-text modalities, JSON-schema-constrained output, logprobs shape
 // differences, routing/labels that are Google-infrastructure-specific).
@@ -169,12 +225,18 @@ export function validateGenerateContentRequest(body) {
     throw new GeminiProtocolError(ERROR_CATEGORY.MALFORMED_REQUEST, 'request body must be a JSON object');
   }
   for (const field of UNSUPPORTED_TOP_LEVEL_FIELDS) {
-    if (body[field] !== undefined && body[field] !== null) {
-      throw new GeminiProtocolError(
-        ERROR_CATEGORY.UNSUPPORTED_REQUEST,
-        `unsupported request field "${field}" (tools/function-calling and cached content are out of scope in this build)`,
-      );
+    if (body[field] === undefined || body[field] === null) continue;
+    if (field === 'tools' && isHarmlessEmptyToolsWrapper(body[field])) {
+      // The real pinned CLI always sends this wrapper (see
+      // isHarmlessEmptyToolsWrapper's doc comment) even with zero built-in
+      // tools registered; it offers the model no capability, so there is
+      // nothing here to silently drop.
+      continue;
     }
+    throw new GeminiProtocolError(
+      ERROR_CATEGORY.UNSUPPORTED_REQUEST,
+      `unsupported request field "${field}" (tools/function-calling and cached content are out of scope in this build)`,
+    );
   }
   if (!Array.isArray(body.contents) || body.contents.length === 0) {
     throw new GeminiProtocolError(ERROR_CATEGORY.MALFORMED_REQUEST, 'request must include a non-empty contents[] array');
@@ -198,12 +260,16 @@ export function validateGenerateContentRequest(body) {
   const generation = {};
   const config = isPlainObject(body.generationConfig) ? body.generationConfig : {};
   for (const field of UNSUPPORTED_GENERATION_CONFIG_FIELDS) {
-    if (config[field] !== undefined && config[field] !== null) {
-      throw new GeminiProtocolError(
-        ERROR_CATEGORY.UNSUPPORTED_GENERATION_CONFIG,
-        `unsupported generationConfig field "${field}" in this build`,
-      );
+    if (config[field] === undefined || config[field] === null) continue;
+    if (field === 'thinkingConfig' && isHarmlessDefaultThinkingConfig(config[field])) {
+      // See isHarmlessDefaultThinkingConfig's doc comment: this is the
+      // unavoidable unknown-model default, not a deliberate ask.
+      continue;
     }
+    throw new GeminiProtocolError(
+      ERROR_CATEGORY.UNSUPPORTED_GENERATION_CONFIG,
+      `unsupported generationConfig field "${field}" in this build`,
+    );
   }
   if (config.candidateCount !== undefined && config.candidateCount !== null && config.candidateCount !== 1) {
     throw new GeminiProtocolError(
