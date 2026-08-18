@@ -456,30 +456,30 @@ test('pinned Gemini local-env verifier blocks runtime-ancestor .gemini/.env', ()
 test(
   'runPhaseBLaunchProbe blocks an ancestor .gemini/.env outside runtimeRoot before spawn',
   async () => {
-  const tempParent = makeTempParent();
-  const marker = path.join(tempParent, 'child-spawned.txt');
-  try {
-    const geminiDir = path.join(tempParent, '.gemini');
-    fs.mkdirSync(geminiDir);
-    fs.writeFileSync(path.join(geminiDir, '.env'), 'SECRET=not-read');
-    const geminiRoot = makeDistribution(
-      tempParent,
-      `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'spawned');`,
-    );
-
-    await assert.rejects(
-      runPhaseBLaunchProbe({
-        geminiRoot,
-        preflightReport: GOOD_PREFLIGHT,
+    const tempParent = makeTempParent();
+    const marker = path.join(tempParent, 'child-spawned.txt');
+    try {
+      const geminiDir = path.join(tempParent, '.gemini');
+      fs.mkdirSync(geminiDir);
+      fs.writeFileSync(path.join(geminiDir, '.env'), 'SECRET=not-read');
+      const geminiRoot = makeDistribution(
         tempParent,
-        timeoutMs: 1500,
-      }),
-      /pinned Gemini local-environment source is discoverable/,
-    );
-    assert.equal(fs.existsSync(marker), false, 'child must never spawn');
-  } finally {
-    fs.rmSync(tempParent, { recursive: true, force: true });
-  }
+        `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'spawned');`,
+      );
+
+      await assert.rejects(
+        runPhaseBLaunchProbe({
+          geminiRoot,
+          preflightReport: GOOD_PREFLIGHT,
+          tempParent,
+          timeoutMs: 1500,
+        }),
+        /pinned Gemini local-environment source is discoverable/,
+      );
+      assert.equal(fs.existsSync(marker), false, 'child must never spawn');
+    } finally {
+      fs.rmSync(tempParent, { recursive: true, force: true });
+    }
   },
 );
 
