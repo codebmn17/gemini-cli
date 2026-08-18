@@ -365,7 +365,10 @@ test('malformed Gemini request (missing contents) is refused with 400', async ()
   const backend = await startFakeBackend((_req, res) => jsonBody(res).end('{}'));
   const adapter = await startAdapter({ backendOrigin: backend.origin, backendModel: BACKEND_MODEL });
   try {
-    const res = await geminiRequest(adapter.origin, 'generateContent', { notContents: true });
+    // An empty body (not an unrecognized-field body) so this exercises the
+    // "missing contents[]" check specifically, distinct from the closed-
+    // world unknown-field rejection covered in test/c1-hardening.test.mjs.
+    const res = await geminiRequest(adapter.origin, 'generateContent', {});
     assert.equal(res.status, 400);
     const json = await res.json();
     assert.equal(json.error.status, 'MALFORMED_REQUEST');
