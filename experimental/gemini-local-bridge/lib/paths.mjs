@@ -10,8 +10,7 @@ export const BRIDGE_NAME = 'gemini-local-bridge';
 /**
  * Resolves HOME strictly at call time from the current process environment
  * (falling back to os.homedir()). Never hardcode Android/Termux package
- * paths (e.g. /data/data/com.termux/files/home) here — this must keep
- * working unmodified on plain Linux, macOS, and Termux alike.
+ * paths here — the same installed payload must work on Linux/macOS/Termux.
  */
 export function resolveHome(env = process.env) {
   const fromEnv = typeof env.HOME === 'string' && env.HOME.length > 0 ? env.HOME : undefined;
@@ -22,16 +21,13 @@ export function resolveHome(env = process.env) {
   return home;
 }
 
-/**
- * Layout is derived fresh from the environment on every call. Nothing here
- * is baked in at install time; the installed launcher recomputes this on
- * every invocation.
- */
+/** Resolves all product-owned paths fresh on every invocation. */
 export function resolveLayout(env = process.env) {
   const home = resolveHome(env);
   const binDir = path.join(home, '.local', 'bin');
   const dataDir = path.join(home, '.local', 'share', BRIDGE_NAME);
   const configDir = path.join(home, '.config', BRIDGE_NAME);
+  const backendRuntimeDir = path.join(dataDir, 'runtime');
   return {
     home,
     binDir,
@@ -40,11 +36,14 @@ export function resolveLayout(env = process.env) {
     configDir,
     provenancePath: path.join(dataDir, 'PROVENANCE.json'),
     vendorDir: path.join(dataDir, 'vendor', 'phase-b'),
-    // As of C2 this is the real local adapter configuration file (see
-    // lib/local-config.mjs) -- the filename predates C2 (it started as a
-    // presence-only placeholder doctor checked for) but the path is the
-    // single, already-documented "is the local backend configured" location,
-    // so C2 promotes it rather than introducing a second config path.
+    // C2 protocol/identity config. Filename is retained for compatibility.
     adapterMarkerPath: path.join(configDir, 'llama-cpp-adapter.json'),
+    // Optional process-ownership config. Its presence authorizes gemini-local
+    // to start the configured local llama-server/model when the loopback
+    // backend is not already healthy. It never authorizes downloads/builds.
+    backendLaunchConfigPath: path.join(configDir, 'llama-cpp-launch.json'),
+    backendRuntimeDir,
+    backendStatePath: path.join(backendRuntimeDir, 'llama-server-state.json'),
+    backendLogPath: path.join(backendRuntimeDir, 'llama-server.log'),
   };
 }
