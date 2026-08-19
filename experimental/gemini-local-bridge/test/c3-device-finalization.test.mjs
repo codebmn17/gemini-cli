@@ -1,10 +1,10 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- *
  * Regressions derived from the first real Termux C3 device run.
  */
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   chmodSync,
@@ -35,6 +35,10 @@ function tempHome(prefix = 'gl-c3-final-') {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+function sha256(text) {
+  return createHash('sha256').update(text).digest('hex');
+}
+
 function minimalConfig(backendOrigin = 'http://127.0.0.1:9') {
   return Object.freeze({
     schemaVersion: 1,
@@ -58,6 +62,19 @@ function healthyResponse() {
     status: 200,
     headers: { 'content-type': 'application/json' },
   });
+}
+
+function writeLaunchConfig(layout, { serverPath, modelPath, serverContent, modelContent }) {
+  writeFileSync(
+    layout.backendLaunchConfigPath,
+    JSON.stringify({
+      schemaVersion: 1,
+      serverPath,
+      serverSha256: sha256(serverContent),
+      modelPath,
+      modelSha256: sha256(modelContent),
+    }) + '\n',
+  );
 }
 
 test('device-found IDE setting in caller HOME no longer blocks isolated local preflight', async () => {
@@ -124,31 +141,46 @@ test('mobile local inference defaults are bounded but no longer the old 30-secon
   assert.ok(DEFAULT_ADAPTER_BACKEND_TIMEOUT_MS < DEFAULT_RUN_TIMEOUT_MS);
 });
 
-test('managed launch config is explicit, absolute, regular-file-only, and no-follow', () => {
+test('managed launch config is explicit, hash-pinned, absolute, regular-file-only, and no-follow', () => {
   const home = tempHome();
   try {
     const layout = resolveLayout({ HOME: home });
     mkdirSync(layout.configDir, { recursive: true });
     const serverPath = path.join(home, 'llama-server');
     const modelPath = path.join(home, 'model.gguf');
-    writeFileSync(serverPath, '#!/bin/sh\nexit 0\n');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    writeFileSync(serverPath, serverContent);
     chmodSync(serverPath, 0o755);
-    writeFileSync(modelPath, 'fake-gguf');
+    writeFileSync(modelPath, modelContent);
 
-    writeFileSync(
-      layout.backendLaunchConfigPath,
-      JSON.stringify({ schemaVersion: 1, serverPath, modelPath }) + '\n',
-    );
+    writeLaunchConfig(layout, { serverPath, modelPath, serverContent, modelContent });
     const config = loadManagedLaunchConfig({ HOME: home });
     assert.equal(config.serverPath, serverPath);
     assert.equal(config.modelPath, modelPath);
+    assert.equal(config.serverSha256, sha256(serverContent));
+    assert.equal(config.modelSha256, sha256(modelContent));
 
-    rmSync(layout.backendLaunchConfigPath);
-    symlinkSync(path.join(home, 'launch-real.json'), layout.backendLaunchConfigPath);
-    writeFileSync(
-      path.join(home, 'launch-real.json'),
-      JSON.stringify({ schemaVersion: 1, serverPath, modelPath }) + '\n',
+    writeFileSync(modelPath, 'tampered-gguf');
+    assert.throws(
+      () => loadManagedLaunchConfig({ HOME: home }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_ARTIFACT_MISMATCH',
     );
+
+    writeFileSync(modelPath, modelContent);
+    rmSync(layout.backendLaunchConfigPath);
+    const realConfig = path.join(home, 'launch-real.json');
+    writeFileSync(
+      realConfig,
+      JSON.stringify({
+        schemaVersion: 1,
+        serverPath,
+        serverSha256: sha256(serverContent),
+        modelPath,
+        modelSha256: sha256(modelContent),
+      }) + '\n',
+    );
+    symlinkSync(realConfig, layout.backendLaunchConfigPath);
     assert.throws(
       () => loadManagedLaunchConfig({ HOME: home }),
       (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_CONFIG_INVALID',
@@ -180,20 +212,19 @@ test('ensureBackendReady reuses an already-healthy backend without launch config
   }
 });
 
-test('ensureBackendReady starts only the configured loopback llama-server with owned argv', async () => {
+test('ensureBackendReady starts only the hash-pinned loopback llama-server with owned argv', async () => {
   const home = tempHome();
   try {
     const layout = resolveLayout({ HOME: home });
     mkdirSync(layout.configDir, { recursive: true });
     const serverPath = path.join(home, 'llama-server');
     const modelPath = path.join(home, 'model.gguf');
-    writeFileSync(serverPath, '#!/bin/sh\nexit 0\n');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    writeFileSync(serverPath, serverContent);
     chmodSync(serverPath, 0o755);
-    writeFileSync(modelPath, 'fake-gguf');
-    writeFileSync(
-      layout.backendLaunchConfigPath,
-      JSON.stringify({ schemaVersion: 1, serverPath, modelPath }) + '\n',
-    );
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, modelPath, serverContent, modelContent });
 
     let healthCalls = 0;
     let captured = null;
@@ -201,7 +232,7 @@ test('ensureBackendReady starts only the configured loopback llama-server with o
     fakeChild.pid = process.pid;
     fakeChild.unref = () => {};
 
-    const resultPromise = ensureBackendReady({
+    const result = await ensureBackendReady({
       config: minimalConfig('http://127.0.0.1:8090'),
       env: { HOME: home, PATH: process.env.PATH ?? '' },
       fetchImpl: async () => {
@@ -216,7 +247,6 @@ test('ensureBackendReady starts only the configured loopback llama-server with o
       startupTimeoutMs: 5_000,
     });
 
-    const result = await resultPromise;
     assert.equal(result.started, true);
     assert.equal(captured.file, serverPath);
     assert.equal(captured.options.shell, false);
