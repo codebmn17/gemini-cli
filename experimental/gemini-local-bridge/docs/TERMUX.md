@@ -1,289 +1,24 @@
 # Running gemini-local on Termux
 
-The current `gemini-local` skeleton/install lifecycle has been validated on a
-real Android/Termux device. The exact executable/test tree accepted on-device
-was:
+This document records the **completed** Android/Termux acceptance of `gemini-local` through Phase C3, including real GGUF inference and managed llama-server startup/reuse/ownership verification.
 
-`a1b59aea2b70a5699956b4fe66b435d4a8c320a0`
+Final executable/test acceptance head:
 
-The accepted scope includes installation, integrity/doctor checks,
-fail-closed prompt behavior, the complete 56-test suite, default uninstall
-with config preservation, reinstall, `--purge`, final reinstall, and
-preservation of the existing Gemini CLI. This does **not** claim validation
-of future llama.cpp model inference or adapter/process-launch behavior that
-is not wired into this skeleton yet. See
-[Accepted device evidence and remaining deferred scope](#accepted-device-evidence-and-remaining-deferred-scope)
-below.
-
-The commands below remain the reproducible validation procedure for a fresh
-or future reviewed transport SHA.
-
-## 1. Read-only environment inspection (do this first, before anything else)
-
-Run exactly this. It only reads state — it installs, updates, or upgrades
-nothing, and changes nothing about the device:
-
-```sh
-uname -a
-printf 'HOME=%s\n' "$HOME"
-printf 'PREFIX=%s\n' "$PREFIX"
-command -v git || true
-git --version 2>/dev/null || true
-command -v node || true
-node --version 2>/dev/null || true
-command -v npm || true
-npm --version 2>/dev/null || true
-command -v gemini || true
-gemini --version 2>/dev/null || true
-command -v llama-server || true
-command -v llama-cli || true
-command -v ollama || true
+```text
+a51e04d24091b2a17c27279ea14ca1f33025d686
 ```
 
-Record the full output. **Do not run `pkg update` / `pkg install` (or any
-other install/upgrade command) as part of this validation pass.** This
-report is meant to establish what is already on the device before any
-change to it is even considered.
+Permanent acceptance ref:
 
-If `git`, `node`, or `npm` needed for the next steps is missing: **stop
-here** and report exactly which prerequisite is missing. Installing it is a
-separate, explicitly authorized step, not something to do automatically as
-part of running this validation. Do not install anything just to make
-validation proceed, and do not change a device that was already in a known
-working state merely to run this check.
-
-Only continue to step 2 once you have confirmed `git` and `node` (with
-`node --test` support, i.e. Node 18+) are already present, or their
-installation has been separately authorized and completed.
-
-## 2. Get the exact reviewed transport commit onto the device
-
-Do **not** install from a movable branch name. Obtain the exact 40-character
-transport SHA from the independent acceptance report/handoff, paste it below,
-and check out that commit detached. The placeholder is intentionally not a
-valid SHA so an unedited copy-paste cannot proceed accidentally.
-
-```sh
-TRANSPORT_SHA='<EXACT_REVIEWED_PR7_SHA>'
-
-cd ~
-git clone --no-checkout https://github.com/codebmn17/gemini-cli.git gemini-local-validation
-cd gemini-local-validation
-git fetch origin "$TRANSPORT_SHA"
-git checkout --detach "$TRANSPORT_SHA"
-ACTUAL_SHA="$(git rev-parse HEAD)"
-printf 'expected transport SHA: %s\n' "$TRANSPORT_SHA"
-printf 'actual transport SHA:   %s\n' "$ACTUAL_SHA"
-[ "$ACTUAL_SHA" = "$TRANSPORT_SHA" ] || {
-  echo 'STOP: checked-out transport SHA does not match the independently accepted SHA.' >&2
-  exit 3
-}
-cd experimental/gemini-local-bridge
+```text
+accepted/gemini-local-c3-device-lifecycle-v1
 ```
 
-If `git fetch origin "$TRANSPORT_SHA"` cannot obtain that exact commit,
-**stop and report it**. Do not substitute the PR branch, `main`, or another
-nearby SHA just to continue.
+The earlier skeleton/install-only acceptance remains preserved separately at `a1b59aea2b70a5699956b4fe66b435d4a8c320a0` and should not be confused with the final local-inference lifecycle acceptance.
 
-## 3. Install
+## 1. Read-only device inspection
 
-```sh
-bash install-gemini-local.sh
-```
-
-This writes only below the product-owned locations:
-
-- `~/.local/bin/gemini-local`
-- `~/.local/share/gemini-local-bridge/`
-- `~/.config/gemini-local-bridge/`
-
-The installer treats `HOME` as the trusted boundary and fails closed if an
-existing path component beneath it that leads to one of those owned targets
-is a symlink or an unexpected filesystem object. It does not touch any
-existing `gemini` binary, any globally installed `@google/gemini-cli` npm
-package, or any path under Termux's `$PREFIX`.
-
-Promoted files retain their reviewed manifest-declared installed modes:
-`0555` for promoted executable launchers and `0444` for promoted
-libraries/package metadata. Their containing vendor directories remain
-owner-writable so a normal non-root Termux user can rename, reinstall,
-clean up staging, and uninstall safely.
-
-## 4. Put the launcher on PATH
-
-The installer does not edit your shell startup file automatically. If
-`~/.local/bin` is not already on PATH, add this yourself (once) to
-`~/.bashrc` (or your shell's equivalent), then reload it:
-
-```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-## 5. Verify
-
-```sh
-command -v gemini-local
-command -v gemini
-gemini-local version
-gemini --version
-gemini-local doctor
-echo "doctor exit: $?"
-```
-
-`doctor` performs filesystem reads and SHA-256 hashing only — no model
-inference, no network request. At the current skeleton stage it should report
-`installState: installed-ok`, `vendored-artifact-integrity` with zero
-failures, and `NOT READY` because no llama.cpp adapter is installed. A
-healthy skeleton doctor exits 0.
-
-For a machine-readable report:
-
-```sh
-gemini-local doctor --json
-```
-
-## 6. Confirm fail-closed behavior
-
-```sh
-gemini-local "hello, can you help me write a poem?"
-echo "exit code: $?"
-```
-
-Expected: no model answer, a non-zero exit, and a message stating that
-`gemini-local` never falls back to hosted Gemini and has no local inference
-backend installed yet. If this instead appears to contact a network endpoint
-or produce model output, stop and report that immediately.
-
-## 7. Run the automated test suite on-device
-
-```sh
-npm test
-
-MJS_COUNT=0
-while IFS= read -r -d '' f; do
-  node --check "$f" || exit 1
-  MJS_COUNT=$((MJS_COUNT + 1))
-done < <(find . -type f -name '*.mjs' -print0)
-echo "mjs files checked: $MJS_COUNT"
-
-bash -n install-gemini-local.sh
-bash -n uninstall-gemini-local.sh
-```
-
-Report the exact pass/fail counts rather than inferring them from a previous
-run.
-
-## 8. Lifecycle validation
-
-Default uninstall must remove the launcher and data directory while
-preserving the config directory:
-
-```sh
-CONFIG_DIR="$HOME/.config/gemini-local-bridge"
-printf 'preserve-me\n' > "$CONFIG_DIR/device-validation-marker.txt"
-
-bash uninstall-gemini-local.sh
-hash -r
-command -v gemini-local || true
-test ! -e "$HOME/.local/share/gemini-local-bridge"
-cat "$CONFIG_DIR/device-validation-marker.txt"
-command -v gemini
-gemini --version
-```
-
-Reinstall, verify `doctor` again, then test purge:
-
-```sh
-bash install-gemini-local.sh
-gemini-local doctor
-
-bash uninstall-gemini-local.sh --purge
-hash -r
-command -v gemini-local || true
-test ! -e "$HOME/.local/bin/gemini-local"
-test ! -e "$HOME/.local/share/gemini-local-bridge"
-test ! -e "$HOME/.config/gemini-local-bridge"
-command -v gemini
-gemini --version
-```
-
-Finally reinstall so the device is left in the intended installed skeleton
-state, rerun `doctor`, reconfirm the exact detached HEAD, and verify that no
-`.stage.*` directory remains.
-
-## Accepted device evidence and remaining deferred scope
-
-The exact executable/test tree
-`a1b59aea2b70a5699956b4fe66b435d4a8c320a0` was validated on a real
-Android 15 / aarch64 Termux device with:
-
-- Git 2.55.0
-- Node v26.4.0
-- npm 11.19.0
-- existing Gemini CLI 0.55.1 at Termux `$PREFIX/bin/gemini`
-
-The first device candidate (`c62673212f716732a87a3e54b7f4daa760c3790e`)
-exposed a real non-root filesystem defect: staged vendor directories were
-changed to mode `0555` before rename/cleanup, causing `Permission denied`.
-The correction removed directory lock-down while preserving promoted file
-modes and added a dedicated Termux directory-permission regression.
-
-At the corrected exact tree `a1b59aea...`, real-device evidence was:
-
-- targeted non-root Termux directory-permission regression: **1/1 passed**
-- real installer: **PASS**
-- no stale `.stage.*` directories after successful install
-- `gemini-local doctor`: `installed-ok`, exact 10-file provenance set,
-  vendored integrity 10/10 with zero failures, expected adapter-absent
-  `NOT READY`, exit **0**
-- arbitrary prompt: no model answer, explicit no-hosted-fallback refusal,
-  exit **3**
-- complete current-head suite: **56/56 passed**, 0 failed/cancelled/skipped/todo
-- all **20/20** applicable `.mjs` files passed `node --check`
-- installer and uninstaller both passed `bash -n`
-- default uninstall: exit 0, launcher/data removed, config marker
-  `preserve-me` survived, normal Gemini remained 0.55.1
-- reinstall after default uninstall: **PASS**, healthy doctor restored
-- purge: exit 0, launcher/data/config removed, `gemini-local` no longer
-  resolved after `hash -r`, normal Gemini remained 0.55.1
-- final reinstall: healthy `installed-ok` doctor, exit 0, normal Gemini still
-  0.55.1, exact HEAD still `a1b59aea...`, no stale `.stage.*` directory
-
-**Accepted for the current skeleton/install lifecycle on this tested Termux
-device.**
-
-After this device run, documentation-only reconciliation updated this file
-and the bundle README. The final transport/documentation head therefore
-advances beyond `a1b59aea...`; the acceptance report must distinguish that
-final transport SHA from the exact executable/test tree above. No executable,
-test, installer, provenance, or vendored artifact was changed by that
-reconciliation.
-
-Still deferred / not claimed by this acceptance:
-
-- installation or configuration of a llama.cpp adapter
-- actual local model inference, streaming, token counting, embeddings, or
-  model traffic
-- future adapter/launcher process-spawn behavior that is not wired into this
-  skeleton
-- behavior on other Android/Termux versions, architectures, shells, or
-  device filesystems not represented by this validation device
-
-Those deferred capabilities require their own exact-SHA implementation and
-real-device validation before they may inherit a Termux acceptance claim.
-
-## C3 device-validation plan (NOT YET EXECUTED)
-
-This section is a **plan only**. None of it has been run on the device. It
-exists so the eventual device session has an exact, reviewed procedure to
-follow rather than improvising one live. Phase C3 (real llama.cpp + a real
-GGUF, proven end to end against the real pinned Gemini CLI) has been proven
-on a Linux host only — see this bundle's README for that host evidence. This
-plan is what turns that host proof into a device acceptance claim; until it
-is actually run and its results recorded, no such claim exists.
-
-### C3-0. Read-only device inspection (run this first; changes nothing)
+Inspect first. Do not install or update packages just to make validation proceed.
 
 ```sh
 uname -m
@@ -301,141 +36,71 @@ command -v npm || true
 npm --version 2>/dev/null || true
 command -v gemini || true
 gemini --version 2>/dev/null || true
-command -v gemini-local || true
-gemini-local doctor 2>/dev/null || true
-
 command -v clang || true
 clang --version 2>/dev/null || true
-command -v cc || true
 command -v cmake || true
 cmake --version 2>/dev/null || true
 command -v make || true
-command -v ninja || true
-ninja --version 2>/dev/null || true
-
 command -v llama-server || true
-command -v llama-cli || true
 command -v ollama || true
 ollama --version 2>/dev/null || true
 ```
 
-Record the full output before anything else. This establishes exactly what
-is already present — a Node/npm/git/`gemini` toolchain is expected to
-already be there from the accepted skeleton validation above, but that must
-be **re-confirmed on this run**, never assumed from the earlier report.
-**Do not run `pkg update`, `pkg install`, `pkg upgrade`, or any other
-package-manager mutation as part of this step or to make this step
-possible.** This is read-only.
+The accepted device already had its required build/runtime tools. No `pkg install`, `pkg update`, or `pkg upgrade` was needed for the accepted run.
 
-### C3-1. Determine what (if anything) needs installing
+If a future device is missing a prerequisite, stop and get separate authorization before any package-manager mutation.
 
-Building `llama-server` needs a C/C++ toolchain and CMake at minimum (a
-generator such as `make` or `ninja`; Termux's `cmake` package pulls in a
-usable generator). Only if C3-0 shows any of `clang`/`cc`, `cmake`, or a
-generator (`make`/`ninja`) missing, the candidate Termux packages are:
+## 2. Check out an exact reviewed SHA
+
+Never install from a movable feature branch during acceptance. Supply the exact reviewed commit out of band and use a detached checkout.
+
+```sh
+TRANSPORT_SHA='<EXACT_REVIEWED_SHA>'
+
+cd ~
+if [ ! -d gemini-local-validation/.git ]; then
+  git clone --no-checkout https://github.com/codebmn17/gemini-cli.git gemini-local-validation
+fi
+cd gemini-local-validation
+git fetch origin "$TRANSPORT_SHA"
+git checkout --detach "$TRANSPORT_SHA"
+ACTUAL_SHA="$(git rev-parse HEAD)"
+printf 'expected transport SHA: %s\n' "$TRANSPORT_SHA"
+printf 'actual transport SHA:   %s\n' "$ACTUAL_SHA"
+[ "$ACTUAL_SHA" = "$TRANSPORT_SHA" ] || {
+  echo 'STOP: exact SHA mismatch.' >&2
+  exit 3
+}
+
+cd experimental/gemini-local-bridge
+```
+
+For the final accepted executable/test state, `TRANSPORT_SHA` was:
 
 ```text
-pkg install clang cmake make git
+a51e04d24091b2a17c27279ea14ca1f33025d686
 ```
 
-**REQUIRES USER AUTHORIZATION BEFORE RUNNING.** Do not run this — or any
-`pkg install`/`pkg update` — until:
-
-- C3-0's output has actually been seen and reviewed (not assumed), and
-- the user has explicitly authorized this exact install list for this
-  exact device.
-
-If C3-0 already shows a working toolchain (a real possibility, since Termux
-devices used for development often already carry one), **skip this step
-entirely** — do not install anything "just in case." Do not substitute a
-different package list than what C3-0's gaps actually show.
-
-### C3-2. Build llama-server from the exact pinned commit
-
-Same pinned commit already built and proven on the Linux host in this
-bundle's README — do not substitute `master` or any other commit:
+## 3. Install the bridge
 
 ```sh
-cd ~
-git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git llama-cpp-c3
-cd llama-cpp-c3
-git fetch origin 0021a77de0a8966059dc94548fb3b96654e0bb12
-git checkout 0021a77de0a8966059dc94548fb3b96654e0bb12
-git rev-parse HEAD   # must print 0021a77de0a8966059dc94548fb3b96654e0bb12 -- stop if it does not
-
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --target llama-server
-./build/bin/llama-server --version
+bash install-gemini-local.sh
+hash -r
 ```
 
-No aarch64/NEON-specific flags are invented here: CMake's default
-architecture detection (`GGML_NATIVE`, on by default) is what the Linux
-host build also relied on, and the pinned commit's own build system is
-authoritative for whatever it auto-detects on-device. If the build fails or
-produces a materially different `--version` output than the Linux host's
-(`version: 0.1.1-dev (build 10479, commit 0021a77de)`, exact build number
-aside), stop and report the exact discrepancy rather than patching around
-it.
+The installer writes only below:
 
-This clones into `~/llama-cpp-c3` — outside `$PREFIX` and outside any
-`gemini-local` install location. It never touches `~/.local/bin`,
-`~/.local/share/gemini-local-bridge/`, `~/.config/gemini-local-bridge/`, or
-`$PREFIX` itself.
-
-### C3-3. Download the smoke-test GGUF (separately authorized)
-
-Same model already selected and proven on the Linux host:
-`Qwen/Qwen2.5-0.5B-Instruct-GGUF`, file `qwen2.5-0.5b-instruct-q4_k_m.gguf`,
-Apache-2.0 licensed, **~491.4 MB download, ~468.7 MiB on disk**. Confirm free
-storage from C3-0 comfortably covers this (host build + this file is under
-1 GB total) before proceeding.
-
-**REQUIRES USER AUTHORIZATION BEFORE RUNNING** — this is a real, sizeable
-download over the device's network connection:
-
-```sh
-mkdir -p ~/c3-models
-cd ~/c3-models
-curl -sSL -o qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-sha256sum qwen2.5-0.5b-instruct-q4_k_m.gguf
+```text
+~/.local/bin/gemini-local
+~/.local/share/gemini-local-bridge/
+~/.config/gemini-local-bridge/
 ```
 
-Expected SHA-256 (from the Linux host download):
-`74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`. If the
-device's hash differs, stop and report it rather than proceeding with a
-file that doesn't match what was already verified.
+It does not replace `/data/data/com.termux/files/usr/bin/gemini`, does not edit the global `@google/gemini-cli` package, and does not modify an existing Ollama install.
 
-### C3-4. Start the real backend, loopback only
+## 4. Configure the pinned Gemini host
 
-```sh
-~/llama-cpp-c3/build/bin/llama-server \
-  -m ~/c3-models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  --host 127.0.0.1 \
-  --port 8090 \
-  -a qwen-test-backend \
-  --no-webui \
-  --offline
-```
-
-Never `--host 0.0.0.0`. No `--tools`, no `--agent`, no `--mcp-servers-config`
-/ `--mcp-servers-json` — all default to disabled/off and must stay that way.
-
-### C3-5. Direct backend sanity checks (same as the host proof)
-
-```sh
-curl -sS http://127.0.0.1:8090/health
-curl -sS http://127.0.0.1:8090/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"qwen-test-backend","messages":[{"role":"user","content":"Reply with exactly the word: pineapple"}],"max_tokens":20,"stream":false}'
-```
-
-Expect `{"status":"ok"}` and a real, non-empty generated response. If either
-differs from the host proof's shape, stop before continuing to C3-6.
-
-### C3-6. Real full-chain proof on-device
-
-Write a local config pointing at the on-device pieces (`~/.config/gemini-local-bridge/llama-cpp-adapter.json`):
+Example accepted protocol/identity config:
 
 ```json
 {
@@ -444,54 +109,244 @@ Write a local config pointing at the on-device pieces (`~/.config/gemini-local-b
   "backendOrigin": "http://127.0.0.1:8090",
   "backendModel": "qwen-test-backend",
   "clientModel": "local-test-client",
-  "geminiRoot": "<path to the existing on-device @google/gemini-cli 0.55.1 install>"
+  "geminiRoot": "/data/data/com.termux/files/usr/lib/node_modules/@google/gemini-cli"
 }
 ```
 
-`geminiRoot` must point at the **existing** on-device pinned Gemini CLI
-0.55.1 install already confirmed by C3-0 (`gemini --version`) — do not
-install a second copy. Then, with the real backend from C3-4 still running:
+Write it to:
 
-```sh
-gemini-local "Reply with the exact token C3_LOCAL_REAL_OK and nothing else."
-echo "exit code: $?"
+```text
+~/.config/gemini-local-bridge/llama-cpp-adapter.json
 ```
 
-Do not treat exact-token compliance as the sole success signal if the
-device's response differs from the host's — record whatever the model
-actually returned. Required, independently checkable evidence: exit 0; a
-non-empty response; `gemini-local doctor`/the response itself never
-mentions a Gemini-branded model name for the backend; the real backend log
-(if verbose logging is enabled) shows `backendModel`, never `clientModel`;
-no leftover `gemini-local-phase-b-*` directory under the device's temp
-directory afterward; the llama-server process from C3-4 still running
-undisturbed (it is not restarted or reconfigured by this step).
+The accepted host package identity was:
 
-### C3-7. Cleanup and preservation check
+```text
+@google/gemini-cli 0.55.1
+```
+
+## 5. Build the pinned llama-server
+
+Accepted llama.cpp source commit:
+
+```text
+0021a77de0a8966059dc94548fb3b96654e0bb12
+```
+
+Reproducible build:
 
 ```sh
-# Stop the C3 llama-server (Ctrl-C or kill its PID) once done.
-command -v gemini
-gemini --version
-command -v ollama
-ollama --version 2>/dev/null || true
+cd ~
+git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git llama-cpp-c3
+cd llama-cpp-c3
+git fetch origin 0021a77de0a8966059dc94548fb3b96654e0bb12
+git checkout --detach 0021a77de0a8966059dc94548fb3b96654e0bb12
+git rev-parse HEAD
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --target llama-server
+./build/bin/llama-server --version
+sha256sum ./build/bin/llama-server
+```
+
+Accepted Android/aarch64 result:
+
+```text
+version: 0.1.1-dev (build 10479, commit 0021a77de)
+SHA-256: 94f9aa667e042be00f8270cc8ae384db0dcf1587b9cac45cc22ce8c85704d594
+```
+
+## 6. Smoke-test GGUF
+
+The accepted smoke model was deliberately tiny because its job was to prove plumbing, not final model quality:
+
+```text
+Qwen/Qwen2.5-0.5B-Instruct-GGUF
+qwen2.5-0.5b-instruct-q4_k_m.gguf
+491400032 bytes
+SHA-256: 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db
+```
+
+Model download was separately authorized. Do not silently substitute another model or hash in an acceptance run.
+
+## 7. Managed backend launch config
+
+Final `gemini-local` can lazily start llama-server itself. The exact local binary and GGUF must be SHA-256 pinned.
+
+Example accepted config:
+
+```json
+{
+  "schemaVersion": 1,
+  "serverPath": "/data/data/com.termux/files/home/llama-cpp-c3/build/bin/llama-server",
+  "serverSha256": "94f9aa667e042be00f8270cc8ae384db0dcf1587b9cac45cc22ce8c85704d594",
+  "modelPath": "/data/data/com.termux/files/home/c3-models/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+  "modelSha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+}
+```
+
+Write it to:
+
+```text
+~/.config/gemini-local-bridge/llama-cpp-launch.json
+```
+
+and set mode `0600`.
+
+No model or server is downloaded automatically. This config only authorizes execution of the already-present, hash-matching local artifacts.
+
+## 8. Doctor and status
+
+`doctor` remains filesystem-only:
+
+```sh
 gemini-local doctor
 ```
 
-Confirm: the pre-existing `gemini` binary/version is unchanged, any
-pre-existing Ollama install is untouched, no `pkg`-managed file outside the
-C3-1 authorized install list was modified, and `gemini-local`'s own install
-state (from the accepted skeleton lifecycle) is unaffected. `~/llama-cpp-c3`
-and `~/c3-models` are disposable scratch directories the user may remove
-once done; they were never referenced by `gemini-local`'s own installed
-paths.
+It verifies installation/provenance/config state without probing backend health or spawning a model.
 
-### What this plan does not authorize
+`status` adds live loopback backend/ownership status:
 
-Running this plan does not itself authorize `pkg install`/`pkg update`
-(C3-1), the GGUF download (C3-3), or anything else marked **REQUIRES USER
-AUTHORIZATION BEFORE RUNNING** above — those remain separate, explicit
-approvals at execution time, not blanket pre-approval from this document
-existing. This plan does not claim C3 device acceptance; only an actually
-executed run, with recorded real results (not a rerun of the host numbers
-above), can.
+```sh
+gemini-local status
+```
+
+A stopped backend should report stopped/not healthy. A managed running backend should report:
+
+```text
+Backend status: managed-running
+Healthy: yes
+Managed: yes
+Owned process verified: yes
+```
+
+## 9. Automatic startup proof
+
+First prove the configured backend is down, then run an ordinary prompt:
+
+```sh
+if curl --silent --fail --max-time 1 http://127.0.0.1:8090/health >/dev/null 2>&1; then
+  echo 'STOP: backend is already running' >&2
+  exit 5
+fi
+
+gemini-local \
+  "Reply with the exact token FINAL_LOCAL_AUTOSTART_OK and nothing else."
+```
+
+Accepted result:
+
+```text
+FINAL_LOCAL_AUTOSTART_OK
+```
+
+with exit 0. The first ordinary prompt automatically started the hash-pinned llama-server/model; a subsequent `/health` returned `{"status":"ok"}`.
+
+## 10. Android ownership verification
+
+The first managed-autostart device run exposed a real platform-specific issue: Termux Node reports:
+
+```text
+process.platform === "android"
+```
+
+while the ownership verifier originally enabled `/proc` verification only for `linux`. `/proc/<pid>/exe` on the device correctly resolved to the exact configured llama-server, so the verifier was corrected to support both Linux and Android.
+
+Final accepted Android ownership evidence:
+
+```text
+Owned process verified: yes
+```
+
+The correction changed only `lib/managed-backend.mjs` and its focused device regression before the final executable acceptance head `a51e04d24091b2a17c27279ea14ca1f33025d686` was accepted.
+
+## 11. Stop, restart and reuse
+
+The managed lifecycle is intentionally conservative: only a process whose recorded state and `/proc` identity are verified may receive destructive stop/restart signals.
+
+```sh
+gemini-local stop
+```
+
+Verify the old PID is gone and port 8090 is down, then:
+
+```sh
+gemini-local restart
+```
+
+Verify a new PID is recorded, backend health is OK and ownership is verified.
+
+Finally run another ordinary prompt:
+
+```sh
+gemini-local \
+  "Reply with the exact token FINAL_LOCAL_REUSE_OK and nothing else."
+```
+
+Accepted result:
+
+```text
+FINAL_LOCAL_REUSE_OK
+```
+
+with exit 0. The managed PID was `13828` both before and after this reuse prompt, proving the already-running backend was reused rather than replaced. Final status was:
+
+```text
+Backend status: managed-running
+Healthy: yes
+Managed: yes
+PID: 13828
+Owned process verified: yes
+```
+
+The previous managed PID before the final stop/restart sequence was `6758`, so the restart produced a new process before the reuse proof.
+
+## 12. Test evidence
+
+Immediately before the final Android-only ownership correction, exact hardened head `302f2705984187157c5834fdcd2c209ec7ea2cab` passed on-device:
+
+```text
+focused device-finalization: 6/6
+full default suite: 159 pass, 0 fail, 1 skip
+real pinned Gemini suite: 160/160, 0 fail, 0 skip
+.mjs syntax: 33/33
+installer bash -n: pass
+uninstaller bash -n: pass
+Phase-B/provenance diff against accepted device proof: empty
+```
+
+The final Android ownership correction then passed its focused regression, syntax check, reinstall, live status and ownership gate on the actual Android device:
+
+```text
+focused=0 syntax=0 install=0 status=0 ownership=0
+```
+
+and the final managed lifecycle behavior in sections 9-11 passed on the corrected executable head.
+
+## 13. Preserved boundaries
+
+Throughout C3 device acceptance:
+
+- normal Gemini remained `/data/data/com.termux/files/usr/bin/gemini` version `0.55.1`;
+- existing Ollama was not replaced or reconfigured;
+- `vendor/phase-b/*` remained the accepted immutable ten-file payload;
+- `PROVENANCE.json` remained unchanged;
+- no hosted-Gemini fallback was enabled;
+- backend binding stayed literal `127.0.0.1`;
+- the local model was never branded or renamed as Gemini;
+- `main` and `product/gemini-local-v1` were not merged or moved.
+
+## 14. Deferred scope
+
+This acceptance does **not** claim:
+
+- interactive Gemini CLI mode;
+- slash-command support;
+- tool/function execution through the local model;
+- embeddings or multi-model routing UX;
+- automatic GGUF downloads or Termux package installation;
+- Android-boot daemon behavior;
+- final long-term model selection;
+- equivalence across untested Android versions, devices or architectures.
+
+The Qwen 0.5B GGUF is only the accepted smoke model. A later model-selection phase can replace it by updating the explicit backend identity/path/hash configuration and validating that model separately.
