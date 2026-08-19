@@ -383,6 +383,16 @@ function stateMatchesConfig(state, config, launch = null) {
   return true;
 }
 
+/**
+ * Linux and Android both expose the procfs identity data this verifier uses.
+ * Node reports Termux as process.platform === 'android', so treating Linux as
+ * the only procfs-capable platform makes every real Termux-owned process look
+ * unverified even when /proc/<pid>/exe and cmdline match exactly.
+ */
+export function supportsProcOwnershipVerification(platform = process.platform) {
+  return platform === 'linux' || platform === 'android';
+}
+
 function verifyOwnedProcess(state) {
   if (!state || !isProcessAlive(state.pid)) return false;
   const currentStartTicks = readProcStartTicks(state.pid);
@@ -390,7 +400,7 @@ function verifyOwnedProcess(state) {
     return false;
   }
 
-  if (process.platform === 'linux') {
+  if (supportsProcOwnershipVerification()) {
     try {
       const exe = realpathSync(`/proc/${state.pid}/exe`);
       if (exe !== state.serverPath) return false;
