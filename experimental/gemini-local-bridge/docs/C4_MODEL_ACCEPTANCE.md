@@ -144,6 +144,9 @@ This records the candidate identity only. It does **not** by itself authorize a
 multi-gigabyte device download. Download remains a separate explicit device
 mutation gate.
 
+**Current gate:** candidate selected and immutable source identity recorded;
+3.46 GiB device download still pending explicit authorization.
+
 ## C4-2: immutable model identity record
 
 Before first acceptance run, record at minimum:
