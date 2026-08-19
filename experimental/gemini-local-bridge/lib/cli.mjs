@@ -32,7 +32,7 @@ function helpText() {
     '  gemini-local restart           restart the configured managed llama-server',
     '  gemini-local version           print bridge version',
     '  gemini-local help              show this message',
-    '  gemini-local <plain prompt>    run the pinned Gemini CLI against the local model',
+    '  gemini-local <plain prompt>    run the pinned Gemini CLI against the configured local backend/model',
     '',
     'If the backend is already healthy it is reused. If it is down and a valid',
     'llama-cpp-launch.json is present, gemini-local starts that exact local',
