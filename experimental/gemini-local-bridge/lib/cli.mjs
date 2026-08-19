@@ -27,7 +27,7 @@ function helpText() {
     '',
     'usage:',
     '  gemini-local doctor [--json]   filesystem/integrity/config diagnostics only (no network)',
-    '  gemini-local status [--json]   live loopback backend/ownership status (no inference)',
+    '  gemini-local status [--json]   doctor diagnostics plus live backend/ownership status',
     '  gemini-local stop              stop only a verified gemini-local-owned llama-server',
     '  gemini-local restart           restart the configured managed llama-server',
     '  gemini-local version           print bridge version',
@@ -95,21 +95,28 @@ export async function main(
   }
 
   if (STATUS_COMMANDS.has(command)) {
+    const report = runDoctor(env);
     const config = loadConfigForRuntimeCommand(env);
-    if (!config) {
-      const status = { status: 'not-configured', healthy: false, managed: false };
-      io.stdout.write((wantsJson ? JSON.stringify(status, null, 2) : formatBackendStatus(status)) + '\n');
-      return 0;
+    let backend = { status: 'not-configured', healthy: false, managed: false };
+    if (config) {
+      try {
+        backend = await getBackendStatus({ config, env });
+      } catch (error) {
+        if (!(error instanceof ManagedBackendError)) throw error;
+        backend = {
+          status: 'status-error',
+          healthy: false,
+          managed: true,
+          detail: `${error.category}: ${error.message}`,
+        };
+      }
     }
-    try {
-      const status = await getBackendStatus({ config, env });
-      io.stdout.write((wantsJson ? JSON.stringify(status, null, 2) : formatBackendStatus(status)) + '\n');
-      return 0;
-    } catch (error) {
-      if (!(error instanceof ManagedBackendError)) throw error;
-      io.stderr.write(`gemini-local status failed (${error.category}): ${error.message}\n`);
-      return LOCAL_RUN_FAILURE_EXIT_CODE;
+    if (wantsJson) {
+      io.stdout.write(JSON.stringify({ doctor: report, backend }, null, 2) + '\n');
+    } else {
+      io.stdout.write(formatDoctorReport(report) + '\n\n' + formatBackendStatus(backend) + '\n');
     }
+    return report.structuralFailure ? DOCTOR_STRUCTURAL_FAILURE_EXIT_CODE : 0;
   }
 
   if (command === 'stop' || command === 'restart') {
