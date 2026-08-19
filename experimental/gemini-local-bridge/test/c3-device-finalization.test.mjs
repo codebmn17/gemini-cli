@@ -27,6 +27,7 @@ import {
 import {
   ensureBackendReady,
   loadManagedLaunchConfig,
+  supportsProcOwnershipVerification,
   ManagedBackendError,
 } from '../lib/managed-backend.mjs';
 import { resolveLayout } from '../lib/paths.mjs';
@@ -139,6 +140,13 @@ test('mobile local inference defaults are bounded but no longer the old 30-secon
   assert.ok(DEFAULT_RUN_TIMEOUT_MS >= 5 * 60_000);
   assert.ok(DEFAULT_ADAPTER_BACKEND_TIMEOUT_MS >= 4 * 60_000);
   assert.ok(DEFAULT_ADAPTER_BACKEND_TIMEOUT_MS < DEFAULT_RUN_TIMEOUT_MS);
+});
+
+test('proc ownership verification supports both Linux hosts and Android/Termux', () => {
+  assert.equal(supportsProcOwnershipVerification('linux'), true);
+  assert.equal(supportsProcOwnershipVerification('android'), true);
+  assert.equal(supportsProcOwnershipVerification('darwin'), false);
+  assert.equal(supportsProcOwnershipVerification('win32'), false);
 });
 
 test('managed launch config is explicit, hash-pinned, absolute, regular-file-only, and no-follow', () => {
