@@ -3,30 +3,34 @@
  *
  * Optional managed llama.cpp lifecycle for gemini-local.
  *
- * The accepted C2 six-key local config remains unchanged. A separate,
- * filesystem-only launch config opts a backend into process ownership:
+ * The accepted C2 six-key protocol config remains unchanged. A separate
+ * filesystem-only launch config opts the backend into process ownership and
+ * pins the exact executable/model artifacts gemini-local is authorized to run:
  *
  *   ~/.config/gemini-local-bridge/llama-cpp-launch.json
  *   {
  *     "schemaVersion": 1,
  *     "serverPath": "/absolute/path/to/llama-server",
- *     "modelPath": "/absolute/path/to/model.gguf"
+ *     "serverSha256": "<64 hex>",
+ *     "modelPath": "/absolute/path/to/model.gguf",
+ *     "modelSha256": "<64 hex>"
  *   }
  *
  * If the configured backend is already healthy, gemini-local reuses it and
  * never starts a duplicate. If it is unhealthy and this launch config is
- * present, gemini-local starts the configured binary/model loopback-only,
- * waits for /health, records narrowly-scoped ownership state, and leaves the
- * server alive for subsequent prompts. No Android-boot persistence is added.
+ * present, gemini-local verifies the configured artifacts, starts them
+ * loopback-only, waits for /health, records narrowly-scoped ownership state,
+ * and leaves the server alive for subsequent prompts. No downloads, builds,
+ * shell execution, or Android-boot persistence are added here.
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   constants as fsConstants,
   accessSync,
   chmodSync,
   closeSync,
-  existsSync,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -35,7 +39,6 @@ import {
   readSync,
   realpathSync,
   renameSync,
-  rmSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -52,7 +55,13 @@ export const BACKEND_STOP_GRACE_MS = 5_000;
 export const BACKEND_KILL_GRACE_MS = 2_000;
 export const MAX_MANAGED_FILE_BYTES = 16 * 1024;
 
-const LAUNCH_KEYS = Object.freeze(['schemaVersion', 'serverPath', 'modelPath']);
+const LAUNCH_KEYS = Object.freeze([
+  'schemaVersion',
+  'serverPath',
+  'serverSha256',
+  'modelPath',
+  'modelSha256',
+]);
 const STATE_KEYS = Object.freeze([
   'schemaVersion',
   'pid',
@@ -60,7 +69,9 @@ const STATE_KEYS = Object.freeze([
   'backendOrigin',
   'backendModel',
   'serverPath',
+  'serverSha256',
   'modelPath',
+  'modelSha256',
   'startedAt',
 ]);
 
@@ -97,6 +108,13 @@ function exactKeys(object, keys) {
   const actual = Object.keys(object).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function requireSha256(value, field) {
+  if (typeof value !== 'string' || !/^[0-9a-fA-F]{64}$/.test(value)) {
+    fail('MANAGED_CONFIG_INVALID', `${field} must be exactly 64 hexadecimal SHA-256 characters`);
+  }
+  return value.toLowerCase();
 }
 
 function readRegularFileNoFollow(targetPath, maxBytes, { absentOk = false } = {}) {
@@ -186,6 +204,44 @@ function requireAbsoluteRegularFile(targetPath, field, { executable = false } = 
   return realpathSync(targetPath);
 }
 
+/** Hash a held, no-follow regular-file descriptor so path substitution during hashing fails closed. */
+function sha256RegularFileNoFollow(targetPath, field) {
+  const before = lstatSync(targetPath);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    fail('MANAGED_CONFIG_INVALID', `${field} must remain a non-symlink regular file`);
+  }
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  const nonBlock = fsConstants.O_NONBLOCK ?? 0;
+  let fd;
+  try {
+    fd = openSync(targetPath, fsConstants.O_RDONLY | noFollow | nonBlock);
+  } catch {
+    fail('MANAGED_CONFIG_INVALID', `unable to open ${field} safely for SHA-256 verification`);
+  }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      fail('MANAGED_CONFIG_INVALID', `${field} identity changed before SHA-256 verification`);
+    }
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let offset = 0;
+    while (true) {
+      const count = readSync(fd, buffer, 0, buffer.length, offset);
+      if (count === 0) break;
+      hash.update(buffer.subarray(0, count));
+      offset += count;
+    }
+    const after = fstatSync(fd);
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+      fail('MANAGED_CONFIG_INVALID', `${field} changed while its SHA-256 was being verified`);
+    }
+    return hash.digest('hex');
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function loadManagedLaunchConfig(env = process.env) {
   const layout = resolveLayout(env);
   const text = readRegularFileNoFollow(layout.backendLaunchConfigPath, MAX_MANAGED_FILE_BYTES, {
@@ -199,9 +255,28 @@ export function loadManagedLaunchConfig(env = process.env) {
   if (parsed.schemaVersion !== MANAGED_LAUNCH_SCHEMA_VERSION) {
     fail('MANAGED_CONFIG_INVALID', `managed backend launch schemaVersion must be ${MANAGED_LAUNCH_SCHEMA_VERSION}`);
   }
+
   const serverPath = requireAbsoluteRegularFile(parsed.serverPath, 'serverPath', { executable: true });
   const modelPath = requireAbsoluteRegularFile(parsed.modelPath, 'modelPath');
-  return Object.freeze({ schemaVersion: parsed.schemaVersion, serverPath, modelPath });
+  const serverSha256 = requireSha256(parsed.serverSha256, 'serverSha256');
+  const modelSha256 = requireSha256(parsed.modelSha256, 'modelSha256');
+
+  const actualServerSha256 = sha256RegularFileNoFollow(serverPath, 'serverPath');
+  if (actualServerSha256 !== serverSha256) {
+    fail('MANAGED_ARTIFACT_MISMATCH', `llama-server SHA-256 mismatch for ${serverPath}`);
+  }
+  const actualModelSha256 = sha256RegularFileNoFollow(modelPath, 'modelPath');
+  if (actualModelSha256 !== modelSha256) {
+    fail('MANAGED_ARTIFACT_MISMATCH', `GGUF SHA-256 mismatch for ${modelPath}`);
+  }
+
+  return Object.freeze({
+    schemaVersion: parsed.schemaVersion,
+    serverPath,
+    serverSha256,
+    modelPath,
+    modelSha256,
+  });
 }
 
 function runtimePaths(env) {
@@ -245,7 +320,6 @@ function readProcStartTicks(pid) {
     const close = raw.lastIndexOf(')');
     if (close === -1) return null;
     const fields = raw.slice(close + 2).trim().split(/\s+/);
-    // /proc/<pid>/stat field 22 is starttime; fields[] begins at field 3.
     return fields[19] ?? null;
   } catch {
     return null;
@@ -260,7 +334,9 @@ function buildState({ pid, config, launch }) {
     backendOrigin: config.backendOrigin,
     backendModel: config.backendModel,
     serverPath: launch.serverPath,
+    serverSha256: launch.serverSha256,
     modelPath: launch.modelPath,
+    modelSha256: launch.modelSha256,
     startedAt: new Date().toISOString(),
   });
 }
@@ -295,7 +371,15 @@ function removeState(env) {
 function stateMatchesConfig(state, config, launch = null) {
   if (!state) return false;
   if (state.backendOrigin !== config.backendOrigin || state.backendModel !== config.backendModel) return false;
-  if (launch && (state.serverPath !== launch.serverPath || state.modelPath !== launch.modelPath)) return false;
+  if (
+    launch &&
+    (state.serverPath !== launch.serverPath ||
+      state.serverSha256 !== launch.serverSha256 ||
+      state.modelPath !== launch.modelPath ||
+      state.modelSha256 !== launch.modelSha256)
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -320,8 +404,6 @@ function verifyOwnedProcess(state) {
     return true;
   }
 
-  // Without /proc we cannot rule out PID reuse strongly enough to send a
-  // destructive signal. Reuse/status still work, but stop/restart refuse.
   return false;
 }
 
