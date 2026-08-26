@@ -426,6 +426,24 @@ function parseManagedEndpoint(origin) {
   return { host: '127.0.0.1', port: url.port };
 }
 
+/** Build the complete launcher-owned llama-server argv for the host platform. */
+export function buildManagedLlamaServerArgs(launch, config, endpoint, platform = process.platform) {
+  const args = [
+    '-m', launch.modelPath,
+    '--host', endpoint.host,
+    '--port', endpoint.port,
+    '-a', config.backendModel,
+    '--no-webui',
+    '--offline',
+  ];
+
+  if (platform === 'android') {
+    args.push('-c', '8192', '-np', '1', '--no-warmup');
+  }
+
+  return Object.freeze(args);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -491,14 +509,7 @@ export async function ensureBackendReady({
   const logFd = openSync(runtime.logPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600);
   chmodSync(runtime.logPath, 0o600);
 
-  const args = Object.freeze([
-    '-m', launch.modelPath,
-    '--host', endpoint.host,
-    '--port', endpoint.port,
-    '-a', config.backendModel,
-    '--no-webui',
-    '--offline',
-  ]);
+  const args = buildManagedLlamaServerArgs(launch, config, endpoint);
 
   let child;
   try {
