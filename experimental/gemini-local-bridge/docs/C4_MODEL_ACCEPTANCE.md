@@ -10,11 +10,13 @@ Termux full-chain execution, and no-hosted-fallback boundary were already
 accepted before C4. C4 does not reopen or weaken those boundaries merely to
 accommodate a model.
 
-## Final verdict
+## Device-tested baseline
 
-**PASS — C4 real-device acceptance is complete.**
+**PASS — the original C4 real-device acceptance is complete at the exact
+executable/test head below. The current PR head contains later production
+review hardening and is not yet device-accepted.**
 
-Executable/device-tested head:
+Last real-device-tested executable/test head:
 
 `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`
 
@@ -281,20 +283,20 @@ platform-aware builder. Independent assertions for the executable,
 stripping remain. The dedicated C4 platform-policy test remains independent.
 No production behavior changed in this correction.
 
-## C4-6: final Android/Termux regression/freeze gate — PASS
+## C4-6: baseline Android/Termux regression/freeze gate — PASS at `68d9ca717...`
 
 The corrected exact head
 `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367` was fetched, checked out detached,
 reinstalled, and re-executed on the real Android/Termux device.
 
-The final gate printed:
+The gate printed:
 
 ```text
 C4-6 PASS — FINAL DEVICE REGRESSION GATE GREEN
 ```
 
-That gate only prints PASS when its acceptance checks are all zero. The final
-device gate covered:
+That gate only prints PASS when its acceptance checks are all zero. The device
+gate covered:
 
 - exact expected checkout SHA;
 - clean worktree;
@@ -313,26 +315,51 @@ device gate covered:
 - final owned-process verification;
 - normal Gemini path/version preservation.
 
-The final real-device executable/test acceptance tree is therefore pinned by
-content at:
+That evidence establishes `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`
+as the last accepted device-tested baseline. It does **not** validate later
+production-code commits.
 
-`68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`
+## Post-acceptance Cloud Codex hardening — DEVICE REVALIDATION REQUIRED
 
-Any documentation-only reconciliation after that commit must be distinguished
-from this executable/device-tested SHA rather than retroactively claiming the
-new docs commit itself was executed on the device.
+Cloud Codex subsequently found a P2 in the healthy managed-backend reuse path:
+a healthy process started under an older launcher policy could be reused before
+current config and launcher policy were compared.
+
+The bounded correction is:
+
+- runtime fix: `8997b1bd60459f83fa4077385524c166f5965089`;
+- regression coverage: `c9a991bdaa20a48ceb0fd5a58e3a83ffdd5ead12`.
+
+The corrected state records a SHA-256 fingerprint of the exact launcher-owned
+argv. Before healthy managed reuse, the runner now compares current protocol
+config, lightweight pinned launch identity, and the current launcher argv
+policy against the recorded state. Legacy state without a policy fingerprint
+is intentionally incompatible. A mismatch fails closed with
+`MANAGED_STATE_CONFLICT` and requires `gemini-local restart`.
+
+The healthy fast path reads configured server/model identity without re-hashing
+the multi-GiB GGUF on every prompt. Full server/model SHA verification remains
+mandatory before any new managed spawn. Restart may replace a differently
+configured prior managed process only after the existing ownership verifier
+proves that the recorded process is still the owned llama-server.
+
+Because this changes production behavior after the prior C4-6 device gate,
+**the current review-hardening head is not accepted yet**. Fresh host validation
+and a fresh Android/Termux final gate must pass on the final executable/test
+head before any new C4 acceptance ref is created. Until then, the permanent
+accepted executable boundary remains `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`.
 
 ## Repo acceptance / freeze state
 
-C4 implementation and real-device acceptance are complete. PR #9 remains
-unmerged by design while the final documentation reconciliation and independent
-review are completed.
+The original C4 model/runtime acceptance is preserved at the baseline SHA above,
+but the current PR head is deliberately **not frozen as accepted** while the
+post-review production hardening awaits fresh validation.
 
-The permanent acceptance ref should point to the exact executable/device-tested
-commit above. If this documentation reconciliation produces a later docs-only
-commit, a separate docs ref may point to that later commit while explicitly
-retaining `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367` as the device-tested code
-boundary.
+Do not create or move a C4 executable/device acceptance ref to the review
+hardening head until the fresh device gate is green. After that gate, reconcile
+this document with the newly tested SHA, create the corresponding acceptance
+ref, and only then close PR #9 unmerged unless a separate integration decision
+explicitly authorizes a merge.
 
 Do not merge PR #9 unless a separate integration decision is explicitly
 authorized.
