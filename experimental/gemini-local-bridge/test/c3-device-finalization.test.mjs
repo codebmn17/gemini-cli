@@ -25,6 +25,7 @@ import {
   DEFAULT_ADAPTER_BACKEND_TIMEOUT_MS,
 } from '../lib/local-gemini-runner.mjs';
 import {
+  buildManagedLlamaServerArgs,
   ensureBackendReady,
   loadManagedLaunchConfig,
   supportsProcOwnershipVerification,
@@ -229,6 +230,7 @@ test('ensureBackendReady starts only the hash-pinned loopback llama-server with 
     const modelPath = path.join(home, 'model.gguf');
     const serverContent = '#!/bin/sh\nexit 0\n';
     const modelContent = 'fake-gguf';
+    const config = minimalConfig('http://127.0.0.1:8090');
     writeFileSync(serverPath, serverContent);
     chmodSync(serverPath, 0o755);
     writeFileSync(modelPath, modelContent);
@@ -241,7 +243,7 @@ test('ensureBackendReady starts only the hash-pinned loopback llama-server with 
     fakeChild.unref = () => {};
 
     const result = await ensureBackendReady({
-      config: minimalConfig('http://127.0.0.1:8090'),
+      config,
       env: { HOME: home, PATH: process.env.PATH ?? '' },
       fetchImpl: async () => {
         healthCalls += 1;
@@ -259,14 +261,10 @@ test('ensureBackendReady starts only the hash-pinned loopback llama-server with 
     assert.equal(captured.file, serverPath);
     assert.equal(captured.options.shell, false);
     assert.equal(captured.options.detached, true);
-    assert.deepEqual(captured.args, [
-      '-m', modelPath,
-      '--host', '127.0.0.1',
-      '--port', '8090',
-      '-a', 'qwen-test-backend',
-      '--no-webui',
-      '--offline',
-    ]);
+    assert.deepEqual(
+      captured.args,
+      buildManagedLlamaServerArgs({ modelPath }, config, { host: '127.0.0.1', port: '8090' }),
+    );
     assert.equal('GEMINI_API_KEY' in captured.options.env, false);
     assert.equal('HTTPS_PROXY' in captured.options.env, false);
   } finally {
