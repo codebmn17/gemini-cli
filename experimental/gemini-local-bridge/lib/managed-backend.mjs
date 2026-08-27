@@ -62,7 +62,7 @@ const LAUNCH_KEYS = Object.freeze([
   'modelPath',
   'modelSha256',
 ]);
-const STATE_KEYS = Object.freeze([
+const LEGACY_STATE_KEYS = Object.freeze([
   'schemaVersion',
   'pid',
   'procStartTicks',
@@ -73,6 +73,10 @@ const STATE_KEYS = Object.freeze([
   'modelPath',
   'modelSha256',
   'startedAt',
+]);
+const STATE_KEYS = Object.freeze([
+  ...LEGACY_STATE_KEYS,
+  'launchArgvSha256',
 ]);
 
 const SAFE_CHILD_ENV_KEYS = Object.freeze([
@@ -242,7 +246,7 @@ function sha256RegularFileNoFollow(targetPath, field) {
   }
 }
 
-export function loadManagedLaunchConfig(env = process.env) {
+function loadManagedLaunchIdentity(env = process.env) {
   const layout = resolveLayout(env);
   const text = readRegularFileNoFollow(layout.backendLaunchConfigPath, MAX_MANAGED_FILE_BYTES, {
     absentOk: true,
@@ -256,27 +260,29 @@ export function loadManagedLaunchConfig(env = process.env) {
     fail('MANAGED_CONFIG_INVALID', `managed backend launch schemaVersion must be ${MANAGED_LAUNCH_SCHEMA_VERSION}`);
   }
 
-  const serverPath = requireAbsoluteRegularFile(parsed.serverPath, 'serverPath', { executable: true });
-  const modelPath = requireAbsoluteRegularFile(parsed.modelPath, 'modelPath');
-  const serverSha256 = requireSha256(parsed.serverSha256, 'serverSha256');
-  const modelSha256 = requireSha256(parsed.modelSha256, 'modelSha256');
-
-  const actualServerSha256 = sha256RegularFileNoFollow(serverPath, 'serverPath');
-  if (actualServerSha256 !== serverSha256) {
-    fail('MANAGED_ARTIFACT_MISMATCH', `llama-server SHA-256 mismatch for ${serverPath}`);
-  }
-  const actualModelSha256 = sha256RegularFileNoFollow(modelPath, 'modelPath');
-  if (actualModelSha256 !== modelSha256) {
-    fail('MANAGED_ARTIFACT_MISMATCH', `GGUF SHA-256 mismatch for ${modelPath}`);
-  }
-
   return Object.freeze({
     schemaVersion: parsed.schemaVersion,
-    serverPath,
-    serverSha256,
-    modelPath,
-    modelSha256,
+    serverPath: requireAbsoluteRegularFile(parsed.serverPath, 'serverPath', { executable: true }),
+    serverSha256: requireSha256(parsed.serverSha256, 'serverSha256'),
+    modelPath: requireAbsoluteRegularFile(parsed.modelPath, 'modelPath'),
+    modelSha256: requireSha256(parsed.modelSha256, 'modelSha256'),
   });
+}
+
+export function loadManagedLaunchConfig(env = process.env) {
+  const launch = loadManagedLaunchIdentity(env);
+  if (!launch) return null;
+
+  const actualServerSha256 = sha256RegularFileNoFollow(launch.serverPath, 'serverPath');
+  if (actualServerSha256 !== launch.serverSha256) {
+    fail('MANAGED_ARTIFACT_MISMATCH', `llama-server SHA-256 mismatch for ${launch.serverPath}`);
+  }
+  const actualModelSha256 = sha256RegularFileNoFollow(launch.modelPath, 'modelPath');
+  if (actualModelSha256 !== launch.modelSha256) {
+    fail('MANAGED_ARTIFACT_MISMATCH', `GGUF SHA-256 mismatch for ${launch.modelPath}`);
+  }
+
+  return launch;
 }
 
 function runtimePaths(env) {
@@ -326,7 +332,11 @@ function readProcStartTicks(pid) {
   }
 }
 
-function buildState({ pid, config, launch }) {
+function launchArgvSha256(args) {
+  return createHash('sha256').update(JSON.stringify(args)).digest('hex');
+}
+
+function buildState({ pid, config, launch, args }) {
   return Object.freeze({
     schemaVersion: 1,
     pid,
@@ -338,6 +348,7 @@ function buildState({ pid, config, launch }) {
     modelPath: launch.modelPath,
     modelSha256: launch.modelSha256,
     startedAt: new Date().toISOString(),
+    launchArgvSha256: launchArgvSha256(args),
   });
 }
 
@@ -353,8 +364,13 @@ function readState(env) {
   const text = readRegularFileNoFollow(statePath, MAX_MANAGED_FILE_BYTES, { absentOk: true });
   if (text === null) return null;
   const parsed = parseJsonObject(text, 'managed backend state');
-  if (!exactKeys(parsed, STATE_KEYS) || parsed.schemaVersion !== 1 || !Number.isSafeInteger(parsed.pid)) {
+  const legacyShape = exactKeys(parsed, LEGACY_STATE_KEYS);
+  const currentShape = exactKeys(parsed, STATE_KEYS);
+  if ((!legacyShape && !currentShape) || parsed.schemaVersion !== 1 || !Number.isSafeInteger(parsed.pid)) {
     fail('MANAGED_STATE_INVALID', 'managed backend state file is malformed');
+  }
+  if (currentShape && !/^[0-9a-f]{64}$/.test(parsed.launchArgvSha256)) {
+    fail('MANAGED_STATE_INVALID', 'managed backend state launchArgvSha256 is malformed');
   }
   return parsed;
 }
@@ -368,7 +384,7 @@ function removeState(env) {
   }
 }
 
-function stateMatchesConfig(state, config, launch = null) {
+function stateMatchesConfig(state, config, launch = null, args = null) {
   if (!state) return false;
   if (state.backendOrigin !== config.backendOrigin || state.backendModel !== config.backendModel) return false;
   if (
@@ -380,6 +396,7 @@ function stateMatchesConfig(state, config, launch = null) {
   ) {
     return false;
   }
+  if (args && state.launchArgvSha256 !== launchArgvSha256(args)) return false;
   return true;
 }
 
@@ -465,6 +482,29 @@ function killOwnedProcessBestEffort(pid) {
   }
 }
 
+async function stopRecordedManagedBackend(state, env) {
+  if (!isProcessAlive(state.pid)) {
+    removeState(env);
+    return Object.freeze({ stopped: false, status: 'stale-state-removed' });
+  }
+  if (!verifyOwnedProcess(state)) {
+    fail('BACKEND_OWNERSHIP_UNVERIFIED', 'refusing to signal a process whose managed ownership cannot be verified');
+  }
+
+  process.kill(state.pid, 'SIGTERM');
+  if (!(await waitForProcessExit(state.pid, BACKEND_STOP_GRACE_MS))) {
+    if (!verifyOwnedProcess(state)) {
+      fail('BACKEND_OWNERSHIP_UNVERIFIED', 'process identity changed while stopping; refusing SIGKILL');
+    }
+    process.kill(state.pid, 'SIGKILL');
+    if (!(await waitForProcessExit(state.pid, BACKEND_KILL_GRACE_MS))) {
+      fail('BACKEND_STOP_FAILED', 'managed llama-server did not terminate after SIGKILL');
+    }
+  }
+  removeState(env);
+  return Object.freeze({ stopped: true, status: 'stopped' });
+}
+
 export async function ensureBackendReady({
   config,
   env = process.env,
@@ -478,8 +518,38 @@ export async function ensureBackendReady({
     fail('MANAGED_CONFIG_INVALID', `startupTimeoutMs must be 1..${MAX_BACKEND_STARTUP_TIMEOUT_MS}`);
   }
 
-  if (await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 })) {
-    return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
+  const existingState = readState(env);
+  const healthy = await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 });
+  if (healthy) {
+    if (!existingState) {
+      return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
+    }
+
+    const launchIdentity = loadManagedLaunchIdentity(env);
+    if (!launchIdentity) {
+      fail(
+        'MANAGED_STATE_CONFLICT',
+        'a healthy managed backend is recorded but the managed launch config is missing; use gemini-local restart',
+      );
+    }
+    const endpoint = parseManagedEndpoint(config.backendOrigin);
+    const expectedArgs = buildManagedLlamaServerArgs(launchIdentity, config, endpoint);
+    if (!stateMatchesConfig(existingState, config, launchIdentity, expectedArgs)) {
+      fail(
+        'MANAGED_STATE_CONFLICT',
+        'healthy managed backend configuration or launch policy differs from the current launcher; use gemini-local restart',
+      );
+    }
+    if (!isProcessAlive(existingState.pid)) {
+      removeState(env);
+      return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
+    }
+    return Object.freeze({
+      ready: true,
+      started: false,
+      mode: 'reused-healthy',
+      pid: existingState.pid,
+    });
   }
 
   const launch = loadManagedLaunchConfig(env);
@@ -490,11 +560,15 @@ export async function ensureBackendReady({
     );
   }
 
-  const existingState = readState(env);
+  const endpoint = parseManagedEndpoint(config.backendOrigin);
+  const args = buildManagedLlamaServerArgs(launch, config, endpoint);
   if (existingState) {
-    if (!stateMatchesConfig(existingState, config, launch)) {
+    if (!stateMatchesConfig(existingState, config, launch, args)) {
       if (isProcessAlive(existingState.pid)) {
-        fail('MANAGED_STATE_CONFLICT', 'another managed backend process is recorded with different configuration');
+        fail(
+          'MANAGED_STATE_CONFLICT',
+          'another managed backend process is recorded with different configuration or launch policy; use gemini-local restart',
+        );
       }
       removeState(env);
     } else if (isProcessAlive(existingState.pid)) {
@@ -504,12 +578,9 @@ export async function ensureBackendReady({
     }
   }
 
-  const endpoint = parseManagedEndpoint(config.backendOrigin);
   const runtime = ensureRuntimeDir(env);
   const logFd = openSync(runtime.logPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600);
   chmodSync(runtime.logPath, 0o600);
-
-  const args = buildManagedLlamaServerArgs(launch, config, endpoint);
 
   let child;
   try {
@@ -547,7 +618,7 @@ export async function ensureBackendReady({
     fail('BACKEND_START_FAILED', 'managed llama-server failed to spawn');
   }
 
-  const state = buildState({ pid: child.pid, config, launch });
+  const state = buildState({ pid: child.pid, config, launch, args });
   try {
     writeStateAtomic(runtime.statePath, state);
   } catch {
@@ -602,6 +673,19 @@ export async function getBackendStatus({ config, env = process.env, fetchImpl = 
   if (!stateMatchesConfig(state, config)) {
     return Object.freeze({ status: 'state-conflict', healthy, managed: true, pid: state.pid });
   }
+
+  const endpoint = parseManagedEndpoint(config.backendOrigin);
+  const currentPolicyArgs = buildManagedLlamaServerArgs({ modelPath: state.modelPath }, config, endpoint);
+  if (state.launchArgvSha256 !== launchArgvSha256(currentPolicyArgs)) {
+    return Object.freeze({
+      status: 'state-conflict',
+      healthy,
+      managed: true,
+      pid: state.pid,
+      detail: 'recorded managed backend launch policy differs from the current launcher',
+    });
+  }
+
   const alive = isProcessAlive(state.pid);
   return Object.freeze({
     status: alive ? (healthy ? 'managed-running' : 'managed-unhealthy') : 'stale-state',
@@ -619,30 +703,11 @@ export async function stopManagedBackend({ config, env = process.env } = {}) {
   if (!stateMatchesConfig(state, config)) {
     fail('MANAGED_STATE_CONFLICT', 'recorded managed backend does not match current local config');
   }
-  if (!isProcessAlive(state.pid)) {
-    removeState(env);
-    return Object.freeze({ stopped: false, status: 'stale-state-removed' });
-  }
-  if (!verifyOwnedProcess(state)) {
-    fail('BACKEND_OWNERSHIP_UNVERIFIED', 'refusing to signal a process whose managed ownership cannot be verified');
-  }
-
-  process.kill(state.pid, 'SIGTERM');
-  if (!(await waitForProcessExit(state.pid, BACKEND_STOP_GRACE_MS))) {
-    if (!verifyOwnedProcess(state)) {
-      fail('BACKEND_OWNERSHIP_UNVERIFIED', 'process identity changed while stopping; refusing SIGKILL');
-    }
-    process.kill(state.pid, 'SIGKILL');
-    if (!(await waitForProcessExit(state.pid, BACKEND_KILL_GRACE_MS))) {
-      fail('BACKEND_STOP_FAILED', 'managed llama-server did not terminate after SIGKILL');
-    }
-  }
-  removeState(env);
-  return Object.freeze({ stopped: true, status: 'stopped' });
+  return stopRecordedManagedBackend(state, env);
 }
 
 export async function restartManagedBackend({ config, env = process.env, fetchImpl = fetch } = {}) {
   const state = readState(env);
-  if (state) await stopManagedBackend({ config, env });
+  if (state) await stopRecordedManagedBackend(state, env);
   return ensureBackendReady({ config, env, fetchImpl });
 }
