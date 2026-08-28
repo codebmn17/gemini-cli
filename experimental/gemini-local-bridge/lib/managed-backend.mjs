@@ -37,9 +37,11 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   readSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -55,6 +57,9 @@ export const MAX_BACKEND_STARTUP_TIMEOUT_MS = 300_000;
 export const BACKEND_STOP_GRACE_MS = 5_000;
 export const BACKEND_KILL_GRACE_MS = 2_000;
 export const MAX_MANAGED_FILE_BYTES = 16 * 1024;
+export const MANAGED_LAUNCH_CLAIM_STALE_MS = MAX_BACKEND_STARTUP_TIMEOUT_MS * 2;
+
+const MANAGED_LAUNCH_CLAIM_FILENAME = 'llama-server-launch-claim';
 
 const LAUNCH_KEYS = Object.freeze([
   'schemaVersion',
@@ -78,6 +83,13 @@ const LEGACY_STATE_KEYS = Object.freeze([
 const STATE_KEYS = Object.freeze([
   ...LEGACY_STATE_KEYS,
   'launchArgvSha256',
+]);
+const LAUNCH_CLAIM_KEYS = Object.freeze([
+  'schemaVersion',
+  'token',
+  'ownerPid',
+  'ownerProcStartTicks',
+  'createdAtMs',
 ]);
 
 const SAFE_CHILD_ENV_KEYS = Object.freeze([
@@ -292,6 +304,7 @@ function runtimePaths(env) {
     ...layout,
     runtimeDir: layout.backendRuntimeDir,
     statePath: layout.backendStatePath,
+    claimPath: path.join(layout.backendRuntimeDir, MANAGED_LAUNCH_CLAIM_FILENAME),
     logPath: layout.backendLogPath,
   };
 }
@@ -353,11 +366,18 @@ function buildState({ pid, config, launch, args }) {
   });
 }
 
+function publishJsonExclusive(targetPath, value) {
+  const temp = `${targetPath}.tmp-${process.pid}-${randomUUID()}`;
+  writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+  try {
+    linkSync(temp, targetPath);
+  } finally {
+    unlinkSync(temp);
+  }
+}
+
 function writeStateAtomic(statePath, state) {
-  const temp = `${statePath}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-  renameSync(temp, statePath);
-  chmodSync(statePath, 0o600);
+  publishJsonExclusive(statePath, state);
 }
 
 function readStatePath(statePath) {
@@ -379,13 +399,66 @@ function readState(env) {
   return readStatePath(runtimePaths(env).statePath);
 }
 
-function removeState(env) {
-  const { statePath } = runtimePaths(env);
-  try {
-    unlinkSync(statePath);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+function launchClaimRecordName(token) {
+  return `owner-${token}.json`;
+}
+
+function parseLaunchClaim(text) {
+  const parsed = parseJsonObject(text, 'managed launch claim');
+  if (
+    !exactKeys(parsed, LAUNCH_CLAIM_KEYS) ||
+    parsed.schemaVersion !== 1 ||
+    !Number.isSafeInteger(parsed.ownerPid) ||
+    parsed.ownerPid <= 1 ||
+    (parsed.ownerProcStartTicks !== null &&
+      (typeof parsed.ownerProcStartTicks !== 'string' || !/^\d+$/.test(parsed.ownerProcStartTicks))) ||
+    !Number.isSafeInteger(parsed.createdAtMs) ||
+    parsed.createdAtMs <= 0 ||
+    typeof parsed.token !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(parsed.token)
+  ) {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim file is malformed');
   }
+  return parsed;
+}
+
+function readLaunchClaim(runtime) {
+  let before;
+  try {
+    before = lstatSync(runtime.claimPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'unable to inspect the managed launch claim');
+  }
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim must be a non-symlink directory');
+  }
+
+  let entries;
+  try {
+    entries = readdirSync(runtime.claimPath);
+  } catch {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'unable to read the managed launch claim');
+  }
+  if (entries.length !== 1 || !/^owner-[0-9a-f-]+\.json$/.test(entries[0])) {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim directory is malformed');
+  }
+  const text = readRegularFileNoFollow(path.join(runtime.claimPath, entries[0]), MAX_MANAGED_FILE_BYTES);
+  const claim = parseLaunchClaim(text);
+  if (entries[0] !== launchClaimRecordName(claim.token)) {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim token does not match its owner record');
+  }
+
+  let after;
+  try {
+    after = lstatSync(runtime.claimPath);
+  } catch {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim changed while being read');
+  }
+  if (!after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim identity changed while being read');
+  }
+  return claim;
 }
 
 function statesEqual(left, right) {
@@ -425,6 +498,112 @@ function removeStateIfMatches(env, expectedState) {
   }
   unlinkSync(claimedPath);
   return true;
+}
+
+function removeLaunchClaimIfMatches(runtime, expectedClaim) {
+  let currentClaim;
+  try {
+    currentClaim = readLaunchClaim(runtime);
+  } catch (error) {
+    throw error;
+  }
+  if (!currentClaim || !statesEqual(currentClaim, expectedClaim)) return false;
+
+  const recordPath = path.join(runtime.claimPath, launchClaimRecordName(expectedClaim.token));
+  try {
+    unlinkSync(recordPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+  try {
+    rmdirSync(runtime.claimPath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return true;
+    if (error?.code === 'ENOTEMPTY' || error?.code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+function launchClaimOwnerPlausiblyAlive(claim) {
+  if (!isProcessAlive(claim.ownerPid)) return false;
+  if (supportsProcOwnershipVerification() && claim.ownerProcStartTicks !== null) {
+    const currentStartTicks = readProcStartTicks(claim.ownerPid);
+    if (currentStartTicks !== null && currentStartTicks !== claim.ownerProcStartTicks) return false;
+  }
+  return true;
+}
+
+function publishLaunchClaimExclusive(runtime, claim) {
+  const stagingPath = `${runtime.claimPath}.tmp-${process.pid}-${claim.token}`;
+  const recordPath = path.join(stagingPath, launchClaimRecordName(claim.token));
+  mkdirSync(stagingPath, { mode: 0o700 });
+  let published = false;
+  try {
+    writeFileSync(recordPath, `${JSON.stringify(claim, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    renameSync(stagingPath, runtime.claimPath);
+    published = true;
+  } finally {
+    if (!published) {
+      try {
+        unlinkSync(recordPath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      try {
+        rmdirSync(stagingPath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+  }
+}
+
+function acquireLaunchClaim(runtime) {
+  const claim = Object.freeze({
+    schemaVersion: 1,
+    token: randomUUID(),
+    ownerPid: process.pid,
+    ownerProcStartTicks: readProcStartTicks(process.pid),
+    createdAtMs: Date.now(),
+  });
+
+  while (true) {
+    try {
+      publishLaunchClaimExclusive(runtime, claim);
+      return claim;
+    } catch (error) {
+      if (error?.code !== 'EEXIST' && error?.code !== 'ENOTEMPTY') {
+        fail('BACKEND_START_FAILED', 'unable to acquire the managed launch claim');
+      }
+    }
+
+    let existingClaim;
+    try {
+      existingClaim = readLaunchClaim(runtime);
+    } catch (error) {
+      if (error instanceof ManagedBackendError) {
+        fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim is invalid and cannot be recovered safely');
+      }
+      throw error;
+    }
+    if (!existingClaim) continue;
+
+    const ageMs = Date.now() - existingClaim.createdAtMs;
+    if (
+      ageMs <= MANAGED_LAUNCH_CLAIM_STALE_MS ||
+      ageMs < 0 ||
+      launchClaimOwnerPlausiblyAlive(existingClaim)
+    ) {
+      fail('MANAGED_LAUNCH_IN_PROGRESS', 'another managed backend launch is already in progress');
+    }
+    if (!removeLaunchClaimIfMatches(runtime, existingClaim)) continue;
+  }
+}
+
+function releaseLaunchClaim(runtime, claim) {
+  return removeLaunchClaimIfMatches(runtime, claim);
 }
 
 function stateMatchesConfig(state, config, launch = null, args = null) {
@@ -527,7 +706,7 @@ function killOwnedProcessBestEffort(pid) {
 
 async function stopRecordedManagedBackend(state, env) {
   if (!isProcessAlive(state.pid)) {
-    removeState(env);
+    removeStateIfMatches(env, state);
     return Object.freeze({ stopped: false, status: 'stale-state-removed' });
   }
   if (!verifyOwnedProcess(state)) {
@@ -544,8 +723,43 @@ async function stopRecordedManagedBackend(state, env) {
       fail('BACKEND_STOP_FAILED', 'managed llama-server did not terminate after SIGKILL');
     }
   }
-  removeState(env);
+  removeStateIfMatches(env, state);
   return Object.freeze({ stopped: true, status: 'stopped' });
+}
+
+function reuseHealthyBackend(config, env, knownLaunchIdentity = null) {
+  let currentState = readState(env);
+  while (currentState && !isProcessAlive(currentState.pid)) {
+    if (removeStateIfMatches(env, currentState)) {
+      return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
+    }
+    currentState = readState(env);
+  }
+  if (!currentState) {
+    return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
+  }
+
+  const launchIdentity = knownLaunchIdentity ?? loadManagedLaunchIdentity(env);
+  if (!launchIdentity) {
+    fail(
+      'MANAGED_STATE_CONFLICT',
+      'a healthy managed backend is recorded but the managed launch config is missing; use gemini-local restart',
+    );
+  }
+  const endpoint = parseManagedEndpoint(config.backendOrigin);
+  const expectedArgs = buildManagedLlamaServerArgs(launchIdentity, config, endpoint);
+  if (!stateMatchesConfig(currentState, config, launchIdentity, expectedArgs)) {
+    fail(
+      'MANAGED_STATE_CONFLICT',
+      'healthy managed backend configuration or launch policy differs from the current launcher; use gemini-local restart',
+    );
+  }
+  return Object.freeze({
+    ready: true,
+    started: false,
+    mode: 'reused-healthy',
+    pid: currentState.pid,
+  });
 }
 
 export async function ensureBackendReady({
@@ -566,38 +780,7 @@ export async function ensureBackendReady({
   readState(env);
   const healthy = await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 });
   if (healthy) {
-    let currentState = readState(env);
-    while (currentState && !isProcessAlive(currentState.pid)) {
-      if (removeStateIfMatches(env, currentState)) {
-        return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
-      }
-      currentState = readState(env);
-    }
-    if (!currentState) {
-      return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
-    }
-
-    const launchIdentity = loadManagedLaunchIdentity(env);
-    if (!launchIdentity) {
-      fail(
-        'MANAGED_STATE_CONFLICT',
-        'a healthy managed backend is recorded but the managed launch config is missing; use gemini-local restart',
-      );
-    }
-    const endpoint = parseManagedEndpoint(config.backendOrigin);
-    const expectedArgs = buildManagedLlamaServerArgs(launchIdentity, config, endpoint);
-    if (!stateMatchesConfig(currentState, config, launchIdentity, expectedArgs)) {
-      fail(
-        'MANAGED_STATE_CONFLICT',
-        'healthy managed backend configuration or launch policy differs from the current launcher; use gemini-local restart',
-      );
-    }
-    return Object.freeze({
-      ready: true,
-      started: false,
-      mode: 'reused-healthy',
-      pid: currentState.pid,
-    });
+    return reuseHealthyBackend(config, env);
   }
 
   const launch = loadManagedLaunchConfig(env);
@@ -610,75 +793,92 @@ export async function ensureBackendReady({
 
   const endpoint = parseManagedEndpoint(config.backendOrigin);
   const args = buildManagedLlamaServerArgs(launch, config, endpoint);
-  let currentState = readState(env);
-  while (currentState) {
-    if (isProcessAlive(currentState.pid)) {
-      if (!stateMatchesConfig(currentState, config, launch, args)) {
-        fail(
-          'MANAGED_STATE_CONFLICT',
-          'another managed backend process is recorded with different configuration or launch policy; use gemini-local restart',
-        );
-      }
-      fail('MANAGED_BACKEND_UNHEALTHY', 'recorded managed llama-server is alive but failed its health check; use gemini-local restart');
-    }
-    if (removeStateIfMatches(env, currentState)) break;
-    currentState = readState(env);
-  }
-
   const runtime = ensureRuntimeDir(env);
-  const logFd = openSync(runtime.logPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600);
-  chmodSync(runtime.logPath, 0o600);
-
+  const claim = acquireLaunchClaim(runtime);
+  let claimOwned = true;
   let child;
+  let state;
   try {
-    child = spawnImpl(launch.serverPath, args, {
-      cwd: path.dirname(launch.modelPath),
-      env: safeChildEnvironment(env),
-      shell: false,
-      detached: true,
-      stdio: ['ignore', logFd, logFd],
-      windowsHide: true,
+    if (await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 })) {
+      return reuseHealthyBackend(config, env, launch);
+    }
+
+    let currentState = readState(env);
+    while (currentState) {
+      if (isProcessAlive(currentState.pid)) {
+        if (!stateMatchesConfig(currentState, config, launch, args)) {
+          fail(
+            'MANAGED_STATE_CONFLICT',
+            'another managed backend process is recorded with different configuration or launch policy; use gemini-local restart',
+          );
+        }
+        fail('MANAGED_BACKEND_UNHEALTHY', 'recorded managed llama-server is alive but failed its health check; use gemini-local restart');
+      }
+      if (removeStateIfMatches(env, currentState)) break;
+      currentState = readState(env);
+    }
+
+    const logFd = openSync(runtime.logPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600);
+    chmodSync(runtime.logPath, 0o600);
+    try {
+      child = spawnImpl(launch.serverPath, args, {
+        cwd: path.dirname(launch.modelPath),
+        env: safeChildEnvironment(env),
+        shell: false,
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+        windowsHide: true,
+      });
+    } catch {
+      closeSync(logFd);
+      fail('BACKEND_START_FAILED', 'failed to spawn managed llama-server');
+    }
+
+    const spawned = await new Promise((resolve) => {
+      let settled = false;
+      child.once('spawn', () => {
+        if (!settled) {
+          settled = true;
+          resolve(true);
+        }
+      });
+      child.once('error', () => {
+        if (!settled) {
+          settled = true;
+          resolve(false);
+        }
+      });
     });
-  } catch {
     closeSync(logFd);
-    fail('BACKEND_START_FAILED', 'failed to spawn managed llama-server');
+
+    if (!spawned || !Number.isSafeInteger(child.pid)) {
+      fail('BACKEND_START_FAILED', 'managed llama-server failed to spawn');
+    }
+
+    state = buildState({ pid: child.pid, config, launch, args });
+    try {
+      writeStateAtomic(runtime.statePath, state);
+    } catch {
+      killOwnedProcessBestEffort(child.pid);
+      fail('BACKEND_START_FAILED', 'unable to record managed llama-server ownership state');
+    }
+
+    child.unref();
+    const released = releaseLaunchClaim(runtime, claim);
+    claimOwned = false;
+    if (!released) {
+      fail('BACKEND_START_FAILED', 'managed launch claim ownership changed before release');
+    }
+  } finally {
+    if (claimOwned && !releaseLaunchClaim(runtime, claim)) {
+      fail('BACKEND_START_FAILED', 'managed launch claim ownership changed before release');
+    }
   }
-
-  const spawned = await new Promise((resolve) => {
-    let settled = false;
-    child.once('spawn', () => {
-      if (!settled) {
-        settled = true;
-        resolve(true);
-      }
-    });
-    child.once('error', () => {
-      if (!settled) {
-        settled = true;
-        resolve(false);
-      }
-    });
-  });
-  closeSync(logFd);
-
-  if (!spawned || !Number.isSafeInteger(child.pid)) {
-    fail('BACKEND_START_FAILED', 'managed llama-server failed to spawn');
-  }
-
-  const state = buildState({ pid: child.pid, config, launch, args });
-  try {
-    writeStateAtomic(runtime.statePath, state);
-  } catch {
-    killOwnedProcessBestEffort(child.pid);
-    fail('BACKEND_START_FAILED', 'unable to record managed llama-server ownership state');
-  }
-
-  child.unref();
 
   const deadline = Date.now() + startupTimeoutMs;
   while (Date.now() < deadline) {
     if (!isProcessAlive(child.pid)) {
-      removeState(env);
+      removeStateIfMatches(env, state);
       fail('BACKEND_START_FAILED', `managed llama-server exited before becoming healthy; see ${runtime.logPath}`);
     }
     if (await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 })) {
@@ -694,7 +894,7 @@ export async function ensureBackendReady({
   }
 
   if (verifyOwnedProcess(state)) killOwnedProcessBestEffort(child.pid);
-  removeState(env);
+  removeStateIfMatches(env, state);
   fail('BACKEND_START_TIMEOUT', `managed llama-server did not become healthy within ${startupTimeoutMs}ms`);
 }
 

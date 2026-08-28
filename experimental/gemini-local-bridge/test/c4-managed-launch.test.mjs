@@ -6,8 +6,8 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { once } from 'node:events';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { EventEmitter, once } from 'node:events';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -17,6 +17,7 @@ import {
   ensureBackendReady,
   getBackendStatus,
   loadManagedLaunchConfig,
+  MANAGED_LAUNCH_CLAIM_STALE_MS,
   ManagedBackendError,
   restartManagedBackend,
 } from '../lib/managed-backend.mjs';
@@ -121,6 +122,113 @@ async function exitedChildPid() {
     (error) => error?.code === 'ESRCH',
   );
   return pid;
+}
+
+function createManagedFixture(prefix) {
+  const home = tempHome(prefix);
+  const layout = resolveLayout({ HOME: home });
+  mkdirSync(layout.configDir, { recursive: true });
+  mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+  const serverPath = path.join(home, 'llama-server');
+  const modelPath = path.join(home, 'model.gguf');
+  const serverContent = '#!/bin/sh\nexit 0\n';
+  const modelContent = 'fake-gguf';
+  const currentConfig = fullConfig();
+  writeFileSync(serverPath, serverContent);
+  chmodSync(serverPath, 0o755);
+  writeFileSync(modelPath, modelContent);
+  writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+  return Object.freeze({
+    home,
+    layout,
+    serverPath,
+    modelPath,
+    serverContent,
+    modelContent,
+    currentConfig,
+    currentArgs: buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint),
+  });
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function concurrentLaunchHealthGate() {
+  const bothInitialChecksEntered = deferred();
+  const releaseInitialChecks = deferred();
+  const postClaimCheckEntered = deferred();
+  const releasePostClaimCheck = deferred();
+  let initialChecks = 0;
+  let postInitialChecks = 0;
+
+  return Object.freeze({
+    bothInitialChecksEntered: bothInitialChecksEntered.promise,
+    releaseInitialChecks: releaseInitialChecks.resolve,
+    postClaimCheckEntered: postClaimCheckEntered.promise,
+    releasePostClaimCheck: releasePostClaimCheck.resolve,
+    fetchImpl: async () => {
+      if (initialChecks < 2) {
+        initialChecks += 1;
+        if (initialChecks === 2) bothInitialChecksEntered.resolve();
+        await releaseInitialChecks.promise;
+        return unhealthyResponse();
+      }
+      postInitialChecks += 1;
+      if (postInitialChecks === 1) {
+        postClaimCheckEntered.resolve();
+        await releasePostClaimCheck.promise;
+        return unhealthyResponse();
+      }
+      return healthyResponse();
+    },
+  });
+}
+
+function fakeSpawnedChild(pid = process.pid) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.unref = () => {};
+  queueMicrotask(() => child.emit('spawn'));
+  return child;
+}
+
+function launchClaimPath(layout) {
+  return path.join(layout.backendRuntimeDir, 'llama-server-launch-claim');
+}
+
+function readLaunchClaimText(layout) {
+  const claimPath = launchClaimPath(layout);
+  const entries = readdirSync(claimPath);
+  assert.equal(entries.length, 1);
+  return readFileSync(path.join(claimPath, entries[0]), 'utf8');
+}
+
+function writeLaunchClaim(layout, {
+  token = '11111111-1111-4111-8111-111111111111',
+  ownerPid = process.pid,
+  ownerProcStartTicks = null,
+  createdAtMs = Date.now(),
+} = {}) {
+  const claimPath = launchClaimPath(layout);
+  mkdirSync(claimPath, { mode: 0o700 });
+  writeFileSync(
+    path.join(claimPath, `owner-${token}.json`),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      token,
+      ownerPid,
+      ownerProcStartTicks,
+      createdAtMs,
+    }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
 }
 
 test('Android managed argv adds only the proven mobile-safe resource bounds', () => {
@@ -615,6 +723,359 @@ test('unhealthy path does not delete live managed state that replaces a dead sna
     assert.equal(JSON.parse(readFileSync(layout.backendStatePath, 'utf8')).pid, process.pid);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('claim winner reuses a backend that becomes healthy before spawn', async () => {
+  const fixture = createManagedFixture('gl-c4-healthy-after-claim-');
+  try {
+    let healthCalls = 0;
+    let spawnCalled = false;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls === 1 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalled = true;
+        throw new Error('must not spawn');
+      },
+    });
+
+    assert.deepEqual(result, { ready: true, started: false, mode: 'reused-healthy' });
+    assert.equal(spawnCalled, false);
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('exclusive launch ownership permits only one concurrent unhealthy caller to spawn', async () => {
+  const fixture = createManagedFixture('gl-c4-concurrent-launch-');
+  try {
+    const gate = concurrentLaunchHealthGate();
+    let spawnCalls = 0;
+    const options = {
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: gate.fetchImpl,
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    };
+
+    const calls = [ensureBackendReady(options), ensureBackendReady(options)];
+    await gate.bothInitialChecksEntered;
+    gate.releaseInitialChecks();
+    await gate.postClaimCheckEntered;
+    gate.releasePostClaimCheck();
+    const results = await Promise.allSettled(calls);
+
+    assert.equal(spawnCalls, 1);
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+    const rejection = results.find((result) => result.status === 'rejected').reason;
+    assert.equal(rejection instanceof ManagedBackendError, true);
+    assert.equal(rejection.category, 'MANAGED_LAUNCH_IN_PROGRESS');
+    assert.equal(JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8')).pid, process.pid);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('concurrent dead-state cleanup still permits only one managed launch', async () => {
+  const fixture = createManagedFixture('gl-c4-concurrent-dead-state-');
+  try {
+    writeCurrentState(fixture.layout, {
+      pid: await exitedChildPid(),
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    const gate = concurrentLaunchHealthGate();
+    let spawnCalls = 0;
+    const options = {
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: gate.fetchImpl,
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    };
+
+    const calls = [ensureBackendReady(options), ensureBackendReady(options)];
+    await gate.bothInitialChecksEntered;
+    gate.releaseInitialChecks();
+    await gate.postClaimCheckEntered;
+    gate.releasePostClaimCheck();
+    const results = await Promise.allSettled(calls);
+
+    assert.equal(spawnCalls, 1);
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    const rejection = results.find((result) => result.status === 'rejected').reason;
+    assert.equal(rejection instanceof ManagedBackendError, true);
+    assert.equal(rejection.category, 'MANAGED_LAUNCH_IN_PROGRESS');
+    assert.equal(JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8')).pid, process.pid);
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('a live process claim cannot be stolen or unlinked regardless of claim age', async () => {
+  const fixture = createManagedFixture('gl-c4-live-launch-claim-');
+  try {
+    writeLaunchClaim(fixture.layout);
+    const claimBefore = readLaunchClaimText(fixture.layout);
+    let spawnCalled = false;
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    assert.equal(spawnCalled, false);
+    assert.equal(readLaunchClaimText(fixture.layout), claimBefore);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+
+    rmSync(launchClaimPath(fixture.layout), { recursive: true });
+    writeLaunchClaim(fixture.layout, {
+      createdAtMs: Date.now() - MANAGED_LAUNCH_CLAIM_STALE_MS - 60_000,
+    });
+    const oldLiveClaim = readLaunchClaimText(fixture.layout);
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+    assert.equal(spawnCalled, false);
+    assert.equal(readLaunchClaimText(fixture.layout), oldLiveClaim);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('a fresh claim from a dead launcher is not recovered before the abandonment window', async () => {
+  const fixture = createManagedFixture('gl-c4-fresh-dead-launch-claim-');
+  try {
+    writeLaunchClaim(fixture.layout, { ownerPid: await exitedChildPid() });
+    const claimBefore = readLaunchClaimText(fixture.layout);
+    let spawnCalled = false;
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    assert.equal(spawnCalled, false);
+    assert.equal(readLaunchClaimText(fixture.layout), claimBefore);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('a provably abandoned launch claim is recovered before managed startup', async () => {
+  const fixture = createManagedFixture('gl-c4-abandoned-launch-claim-');
+  try {
+    writeLaunchClaim(fixture.layout, {
+      ownerPid: await exitedChildPid(),
+      createdAtMs: Date.now() - MANAGED_LAUNCH_CLAIM_STALE_MS - 60_000,
+    });
+    let healthCalls = 0;
+    let spawnCalls = 0;
+
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(spawnCalls, 1);
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+    assert.equal(JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8')).pid, process.pid);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('spawn failure releases the owned launch claim and permits a later launch', async () => {
+  const fixture = createManagedFixture('gl-c4-spawn-claim-cleanup-');
+  try {
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          throw new Error('synthetic spawn failure');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_FAILED',
+    );
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          const child = new EventEmitter();
+          child.pid = process.pid;
+          child.unref = () => {};
+          queueMicrotask(() => child.emit('error', new Error('synthetic asynchronous spawn failure')));
+          return child;
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_FAILED',
+    );
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => fakeSpawnedChild(),
+      startupTimeoutMs: 5_000,
+    });
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('state publication failure preserves authoritative state and releases the launch claim', async () => {
+  const fixture = createManagedFixture('gl-c4-publication-claim-cleanup-');
+  try {
+    const deadChildPid = await exitedChildPid();
+    let authoritativeState = null;
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          writeCurrentState(fixture.layout, {
+            pid: process.pid,
+            currentConfig: fixture.currentConfig,
+            serverPath: fixture.serverPath,
+            serverContent: fixture.serverContent,
+            modelPath: fixture.modelPath,
+            modelContent: fixture.modelContent,
+            launchArgvSha256: argvSha256(fixture.currentArgs),
+          });
+          authoritativeState = readFileSync(fixture.layout.backendStatePath, 'utf8');
+          return fakeSpawnedChild(deadChildPid);
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_FAILED',
+    );
+
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), authoritativeState);
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('claim release cannot unlink a replacement claim with a different token', async () => {
+  const fixture = createManagedFixture('gl-c4-token-safe-release-');
+  try {
+    const successorToken = '22222222-2222-4222-8222-222222222222';
+    let successorClaim = null;
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          rmSync(launchClaimPath(fixture.layout), { recursive: true });
+          writeLaunchClaim(fixture.layout, { token: successorToken });
+          successorClaim = readLaunchClaimText(fixture.layout);
+          return fakeSpawnedChild();
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_FAILED',
+    );
+
+    assert.equal(readLaunchClaimText(fixture.layout), successorClaim);
+    assert.equal(JSON.parse(successorClaim).token, successorToken);
+    assert.equal(existsSync(fixture.layout.backendStatePath), true);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('startup timeout leaves neither the published state nor a stale launch claim', async () => {
+  const fixture = createManagedFixture('gl-c4-timeout-claim-cleanup-');
+  try {
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => fakeSpawnedChild(),
+        startupTimeoutMs: 1,
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_TIMEOUT',
+    );
+
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
   }
 });
 

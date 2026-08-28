@@ -236,7 +236,7 @@ test('ensureBackendReady starts only the hash-pinned loopback llama-server with 
     writeFileSync(modelPath, modelContent);
     writeLaunchConfig(layout, { serverPath, modelPath, serverContent, modelContent });
 
-    let healthCalls = 0;
+    let spawnStarted = false;
     let captured = null;
     const fakeChild = new EventEmitter();
     fakeChild.pid = process.pid;
@@ -246,10 +246,10 @@ test('ensureBackendReady starts only the hash-pinned loopback llama-server with 
       config,
       env: { HOME: home, PATH: process.env.PATH ?? '' },
       fetchImpl: async () => {
-        healthCalls += 1;
-        return healthCalls === 1 ? unhealthyResponse() : healthyResponse();
+        return spawnStarted ? healthyResponse() : unhealthyResponse();
       },
       spawnImpl: (file, args, options) => {
+        spawnStarted = true;
         captured = { file, args, options };
         queueMicrotask(() => fakeChild.emit('spawn'));
         return fakeChild;
