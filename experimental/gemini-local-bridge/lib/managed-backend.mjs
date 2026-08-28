@@ -671,18 +671,47 @@ export async function getBackendStatus({ config, env = process.env, fetchImpl = 
     });
   }
   if (!stateMatchesConfig(state, config)) {
-    return Object.freeze({ status: 'state-conflict', healthy, managed: true, pid: state.pid });
-  }
-
-  const endpoint = parseManagedEndpoint(config.backendOrigin);
-  const currentPolicyArgs = buildManagedLlamaServerArgs({ modelPath: state.modelPath }, config, endpoint);
-  if (state.launchArgvSha256 !== launchArgvSha256(currentPolicyArgs)) {
     return Object.freeze({
       status: 'state-conflict',
       healthy,
       managed: true,
       pid: state.pid,
-      detail: 'recorded managed backend launch policy differs from the current launcher',
+      detail: 'recorded managed backend does not match the current protocol config; use gemini-local restart',
+    });
+  }
+
+  let launchIdentity;
+  try {
+    launchIdentity = loadManagedLaunchIdentity(env);
+  } catch (error) {
+    if (!(error instanceof ManagedBackendError)) throw error;
+    return Object.freeze({
+      status: 'state-conflict',
+      healthy,
+      managed: true,
+      pid: state.pid,
+      detail: 'current managed launch config is invalid; use gemini-local restart',
+    });
+  }
+  if (!launchIdentity) {
+    return Object.freeze({
+      status: 'state-conflict',
+      healthy,
+      managed: true,
+      pid: state.pid,
+      detail: 'current managed launch config is missing; use gemini-local restart',
+    });
+  }
+
+  const endpoint = parseManagedEndpoint(config.backendOrigin);
+  const currentPolicyArgs = buildManagedLlamaServerArgs(launchIdentity, config, endpoint);
+  if (!stateMatchesConfig(state, config, launchIdentity, currentPolicyArgs)) {
+    return Object.freeze({
+      status: 'state-conflict',
+      healthy,
+      managed: true,
+      pid: state.pid,
+      detail: 'recorded managed backend launch identity or policy differs from the current launcher; use gemini-local restart',
     });
   }
 

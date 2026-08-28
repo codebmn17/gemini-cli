@@ -15,6 +15,7 @@ import { test } from 'node:test';
 import {
   buildManagedLlamaServerArgs,
   ensureBackendReady,
+  getBackendStatus,
   loadManagedLaunchConfig,
   ManagedBackendError,
   restartManagedBackend,
@@ -374,6 +375,102 @@ test('healthy managed backend with matching identity rejects an incorrect launch
         String(error.message).includes('launch policy'),
     );
     assert.equal(spawnCalled, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('status reports conflict when current launch identity selects a different model', async () => {
+  const home = tempHome('gl-c4-status-model-change-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const oldModelPath = path.join(home, 'old-model.gguf');
+    const newModelPath = path.join(home, 'new-model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const oldModelContent = 'old-fake-gguf';
+    const newModelContent = 'new-fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(oldModelPath, oldModelContent);
+    writeFileSync(newModelPath, newModelContent);
+    writeLaunchConfig(layout, {
+      serverPath,
+      serverContent,
+      modelPath: newModelPath,
+      modelContent: newModelContent,
+    });
+
+    const oldArgs = buildManagedLlamaServerArgs({ modelPath: oldModelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: process.pid,
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath: oldModelPath,
+      modelContent: oldModelContent,
+      launchArgvSha256: argvSha256(oldArgs),
+    });
+
+    const result = await getBackendStatus({
+      config: currentConfig,
+      env: { HOME: home },
+      fetchImpl: async () => healthyResponse(),
+    });
+
+    assert.equal(result.status, 'state-conflict');
+    assert.equal(result.healthy, true);
+    assert.equal(result.managed, true);
+    assert.equal(result.pid, process.pid);
+    assert.match(result.detail, /restart/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('status reports managed-running for matching current launch identity without artifact rehash', async () => {
+  const home = tempHome('gl-c4-status-current-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: process.pid,
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(currentArgs),
+    });
+    writeFileSync(modelPath, 'changed-after-managed-start');
+
+    const result = await getBackendStatus({
+      config: currentConfig,
+      env: { HOME: home },
+      fetchImpl: async () => healthyResponse(),
+    });
+
+    assert.equal(result.status, 'managed-running');
+    assert.equal(result.healthy, true);
+    assert.equal(result.managed, true);
+    assert.equal(result.pid, process.pid);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
