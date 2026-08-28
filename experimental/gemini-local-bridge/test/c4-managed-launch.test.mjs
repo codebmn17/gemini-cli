@@ -4,8 +4,10 @@
  */
 
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -15,6 +17,7 @@ import {
   ensureBackendReady,
   loadManagedLaunchConfig,
   ManagedBackendError,
+  restartManagedBackend,
 } from '../lib/managed-backend.mjs';
 import { resolveLayout } from '../lib/paths.mjs';
 
@@ -59,6 +62,10 @@ function fullConfig() {
   });
 }
 
+function tempHome(prefix) {
+  return realpathSync(mkdtempSync(path.join(os.tmpdir(), prefix)));
+}
+
 function writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent }) {
   writeFileSync(
     layout.backendLaunchConfigPath,
@@ -68,6 +75,28 @@ function writeLaunchConfig(layout, { serverPath, serverContent, modelPath, model
       serverSha256: sha256(serverContent),
       modelPath,
       modelSha256: sha256(modelContent),
+    }) + '\n',
+  );
+}
+
+function writeCurrentState(
+  layout,
+  { pid, currentConfig, serverPath, serverContent, modelPath, modelContent, launchArgvSha256 },
+) {
+  writeFileSync(
+    layout.backendStatePath,
+    JSON.stringify({
+      schemaVersion: 1,
+      pid,
+      procStartTicks: null,
+      backendOrigin: currentConfig.backendOrigin,
+      backendModel: currentConfig.backendModel,
+      serverPath,
+      serverSha256: sha256(serverContent),
+      modelPath,
+      modelSha256: sha256(modelContent),
+      startedAt: new Date().toISOString(),
+      launchArgvSha256,
     }) + '\n',
   );
 }
@@ -98,7 +127,7 @@ test('Linux and other non-Android managed argv remain at the accepted pre-C4 for
 });
 
 test('managed resource bounds are launcher-owned and cannot be supplied through launch config', () => {
-  const home = mkdtempSync(path.join(os.tmpdir(), 'gl-c4-launch-'));
+  const home = tempHome('gl-c4-launch-');
   try {
     const layout = resolveLayout({ HOME: home });
     mkdirSync(layout.configDir, { recursive: true });
@@ -131,7 +160,7 @@ test('managed resource bounds are launcher-owned and cannot be supplied through 
 });
 
 test('healthy managed backend with legacy state is not reused across a launcher-policy change', async () => {
-  const home = mkdtempSync(path.join(os.tmpdir(), 'gl-c4-policy-'));
+  const home = tempHome('gl-c4-policy-');
   try {
     const layout = resolveLayout({ HOME: home });
     mkdirSync(layout.configDir, { recursive: true });
@@ -186,7 +215,7 @@ test('healthy managed backend with legacy state is not reused across a launcher-
 });
 
 test('healthy managed backend is not reused after the pinned launch model changes', async () => {
-  const home = mkdtempSync(path.join(os.tmpdir(), 'gl-c4-model-change-'));
+  const home = tempHome('gl-c4-model-change-');
   try {
     const layout = resolveLayout({ HOME: home });
     mkdirSync(layout.configDir, { recursive: true });
@@ -245,6 +274,186 @@ test('healthy managed backend is not reused after the pinned launch model change
       (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_STATE_CONFLICT',
     );
   } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('healthy managed backend with matching current policy reuses the recorded PID without spawning', async () => {
+  const home = tempHome('gl-c4-current-policy-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: process.pid,
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(currentArgs),
+    });
+
+    let spawnCalled = false;
+    const result = await ensureBackendReady({
+      config: currentConfig,
+      env: { HOME: home },
+      fetchImpl: async () => healthyResponse(),
+      spawnImpl: () => {
+        spawnCalled = true;
+        throw new Error('must not spawn');
+      },
+    });
+
+    assert.deepEqual(result, {
+      ready: true,
+      started: false,
+      mode: 'reused-healthy',
+      pid: process.pid,
+    });
+    assert.equal(spawnCalled, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('healthy managed backend with matching identity rejects an incorrect launch policy fingerprint', async () => {
+  const home = tempHome('gl-c4-fingerprint-mismatch-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: process.pid,
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256([...currentArgs, '--unexpected-policy-token']),
+    });
+
+    let spawnCalled = false;
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: currentConfig,
+        env: { HOME: home },
+        fetchImpl: async () => healthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) =>
+        error instanceof ManagedBackendError &&
+        error.category === 'MANAGED_STATE_CONFLICT' &&
+        String(error.message).includes('launch policy'),
+    );
+    assert.equal(spawnCalled, false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('restart refuses to replace a live process whose managed ownership cannot be verified', async () => {
+  const home = tempHome('gl-c4-restart-ownership-');
+  let probeChild = null;
+  let probeClosed = null;
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+    const probeScript = [
+      "process.on('SIGTERM', () => process.send({ type: 'signal', signal: 'SIGTERM' }));",
+      "process.send({ type: 'ready' });",
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    probeChild = spawn(process.execPath, ['-e', probeScript], {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    probeClosed = once(probeChild, 'close');
+    const readyMessage = once(probeChild, 'message');
+    await once(probeChild, 'spawn');
+    assert.deepEqual((await readyMessage)[0], { type: 'ready' });
+    const probeSignals = [];
+    probeChild.on('message', (message) => {
+      if (message?.type === 'signal') probeSignals.push(message.signal);
+    });
+
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: probeChild.pid,
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(currentArgs),
+    });
+
+    let fetchCalled = false;
+    await assert.rejects(
+      () => restartManagedBackend({
+        config: currentConfig,
+        env: { HOME: home },
+        fetchImpl: async () => {
+          fetchCalled = true;
+          return healthyResponse();
+        },
+      }),
+      (error) =>
+        error instanceof ManagedBackendError &&
+        error.category === 'BACKEND_OWNERSHIP_UNVERIFIED' &&
+        String(error.message).includes('refusing to signal'),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(fetchCalled, false);
+    assert.deepEqual(probeSignals, []);
+    assert.doesNotThrow(() => process.kill(probeChild.pid, 0));
+    assert.equal(probeChild.exitCode, null);
+    assert.equal(probeChild.signalCode, null);
+    assert.equal(existsSync(layout.backendStatePath), true);
+  } finally {
+    if (probeChild) {
+      if (probeChild.exitCode === null && probeChild.signalCode === null) probeChild.kill('SIGKILL');
+      await probeClosed;
+    }
     rmSync(home, { recursive: true, force: true });
   }
 });
