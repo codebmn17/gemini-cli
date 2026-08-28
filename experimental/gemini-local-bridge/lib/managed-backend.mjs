@@ -561,7 +561,9 @@ export async function ensureBackendReady({
     fail('MANAGED_CONFIG_INVALID', `startupTimeoutMs must be 1..${MAX_BACKEND_STARTUP_TIMEOUT_MS}`);
   }
 
-  const existingState = readState(env);
+  // Preserve fail-closed state validation before the health request, then
+  // re-read after asynchronous work before making any reuse/spawn decision.
+  readState(env);
   const healthy = await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 });
   if (healthy) {
     let currentState = readState(env);
@@ -608,20 +610,19 @@ export async function ensureBackendReady({
 
   const endpoint = parseManagedEndpoint(config.backendOrigin);
   const args = buildManagedLlamaServerArgs(launch, config, endpoint);
-  if (existingState) {
-    if (!stateMatchesConfig(existingState, config, launch, args)) {
-      if (isProcessAlive(existingState.pid)) {
+  let currentState = readState(env);
+  while (currentState) {
+    if (isProcessAlive(currentState.pid)) {
+      if (!stateMatchesConfig(currentState, config, launch, args)) {
         fail(
           'MANAGED_STATE_CONFLICT',
           'another managed backend process is recorded with different configuration or launch policy; use gemini-local restart',
         );
       }
-      removeState(env);
-    } else if (isProcessAlive(existingState.pid)) {
       fail('MANAGED_BACKEND_UNHEALTHY', 'recorded managed llama-server is alive but failed its health check; use gemini-local restart');
-    } else {
-      removeState(env);
     }
+    if (removeStateIfMatches(env, currentState)) break;
+    currentState = readState(env);
   }
 
   const runtime = ensureRuntimeDir(env);
@@ -716,6 +717,16 @@ export async function getBackendStatus({ config, env = process.env, fetchImpl = 
       managed: false,
     });
   }
+  const alive = isProcessAlive(state.pid);
+  if (!alive) {
+    return Object.freeze({
+      status: 'stale-state',
+      healthy,
+      managed: true,
+      pid: state.pid,
+      ownedProcessVerified: false,
+    });
+  }
   if (!stateMatchesConfig(state, config)) {
     return Object.freeze({
       status: 'state-conflict',
@@ -761,13 +772,12 @@ export async function getBackendStatus({ config, env = process.env, fetchImpl = 
     });
   }
 
-  const alive = isProcessAlive(state.pid);
   return Object.freeze({
-    status: alive ? (healthy ? 'managed-running' : 'managed-unhealthy') : 'stale-state',
+    status: healthy ? 'managed-running' : 'managed-unhealthy',
     healthy,
     managed: true,
     pid: state.pid,
-    ownedProcessVerified: alive ? verifyOwnedProcess(state) : false,
+    ownedProcessVerified: verifyOwnedProcess(state),
   });
 }
 

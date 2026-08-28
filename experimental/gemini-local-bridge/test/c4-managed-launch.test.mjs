@@ -56,6 +56,13 @@ function healthyResponse() {
   });
 }
 
+function unhealthyResponse() {
+  return new Response(JSON.stringify({ status: 'loading' }), {
+    status: 503,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
 function fullConfig() {
   return Object.freeze({
     backendOrigin: 'http://127.0.0.1:8090',
@@ -501,6 +508,116 @@ test('healthy backend with live managed state still rejects a missing launch ide
   }
 });
 
+test('unhealthy path re-reads managed state written during the health check before spawning', async () => {
+  const home = tempHome('gl-c4-unhealthy-state-created-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    let spawnCalled = false;
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: currentConfig,
+        env: { HOME: home },
+        fetchImpl: async () => {
+          writeCurrentState(layout, {
+            pid: process.pid,
+            currentConfig,
+            serverPath,
+            serverContent,
+            modelPath,
+            modelContent,
+            launchArgvSha256: argvSha256(currentArgs),
+          });
+          return unhealthyResponse();
+        },
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_BACKEND_UNHEALTHY',
+    );
+
+    assert.equal(spawnCalled, false);
+    assert.equal(JSON.parse(readFileSync(layout.backendStatePath, 'utf8')).pid, process.pid);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('unhealthy path does not delete live managed state that replaces a dead snapshot', async () => {
+  const home = tempHome('gl-c4-unhealthy-state-replaced-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: await exitedChildPid(),
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(currentArgs),
+    });
+
+    let spawnCalled = false;
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: currentConfig,
+        env: { HOME: home },
+        fetchImpl: async () => {
+          writeCurrentState(layout, {
+            pid: process.pid,
+            currentConfig,
+            serverPath,
+            serverContent,
+            modelPath,
+            modelContent,
+            launchArgvSha256: argvSha256(currentArgs),
+          });
+          return unhealthyResponse();
+        },
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_BACKEND_UNHEALTHY',
+    );
+
+    assert.equal(spawnCalled, false);
+    assert.equal(JSON.parse(readFileSync(layout.backendStatePath, 'utf8')).pid, process.pid);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('healthy managed backend with matching current policy reuses the recorded PID without spawning', async () => {
   const home = tempHome('gl-c4-current-policy-');
   try {
@@ -693,6 +810,49 @@ test('status reports managed-running for matching current launch identity withou
     assert.equal(result.healthy, true);
     assert.equal(result.managed, true);
     assert.equal(result.pid, process.pid);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('status reports stale state before requiring a missing launch identity', async () => {
+  const home = tempHome('gl-c4-status-dead-missing-launch-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'old-llama-server');
+    const modelPath = path.join(home, 'old-model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'old-fake-gguf';
+    const currentConfig = fullConfig();
+    const oldArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    const deadPid = await exitedChildPid();
+    writeCurrentState(layout, {
+      pid: deadPid,
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(oldArgs),
+    });
+
+    const result = await getBackendStatus({
+      config: currentConfig,
+      env: { HOME: home },
+      fetchImpl: async () => healthyResponse(),
+    });
+
+    assert.deepEqual(result, {
+      status: 'stale-state',
+      healthy: true,
+      managed: true,
+      pid: deadPid,
+      ownedProcessVerified: false,
+    });
+    assert.equal(existsSync(layout.backendStatePath), true);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
