@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -100,6 +100,20 @@ function writeCurrentState(
       launchArgvSha256,
     }) + '\n',
   );
+}
+
+async function exitedChildPid() {
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  const spawned = once(child, 'spawn');
+  const closed = once(child, 'close');
+  await spawned;
+  const pid = child.pid;
+  await closed;
+  assert.throws(
+    () => process.kill(pid, 0),
+    (error) => error?.code === 'ESRCH',
+  );
+  return pid;
 }
 
 test('Android managed argv adds only the proven mobile-safe resource bounds', () => {
@@ -274,6 +288,214 @@ test('healthy managed backend is not reused after the pinned launch model change
       }),
       (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_STATE_CONFLICT',
     );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('healthy backend removes dead managed state before requiring a missing launch config', async () => {
+  const home = tempHome('gl-c4-dead-state-missing-launch-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'old-llama-server');
+    const modelPath = path.join(home, 'old-model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'old-fake-gguf';
+    const currentConfig = fullConfig();
+    const oldArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: await exitedChildPid(),
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(oldArgs),
+    });
+
+    let spawnCalled = false;
+    const result = await ensureBackendReady({
+      config: currentConfig,
+      env: { HOME: home },
+      fetchImpl: async () => healthyResponse(),
+      spawnImpl: () => {
+        spawnCalled = true;
+        throw new Error('must not spawn');
+      },
+    });
+
+    assert.deepEqual(result, { ready: true, started: false, mode: 'reused-healthy' });
+    assert.equal(spawnCalled, false);
+    assert.equal(existsSync(layout.backendStatePath), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('healthy backend removes dead managed state before comparing a changed launch identity', async () => {
+  const home = tempHome('gl-c4-dead-state-changed-launch-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const oldModelPath = path.join(home, 'old-model.gguf');
+    const newModelPath = path.join(home, 'new-model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const oldModelContent = 'old-fake-gguf';
+    const newModelContent = 'new-fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(oldModelPath, oldModelContent);
+    writeFileSync(newModelPath, newModelContent);
+    writeLaunchConfig(layout, {
+      serverPath,
+      serverContent,
+      modelPath: newModelPath,
+      modelContent: newModelContent,
+    });
+
+    const oldArgs = buildManagedLlamaServerArgs({ modelPath: oldModelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: await exitedChildPid(),
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath: oldModelPath,
+      modelContent: oldModelContent,
+      launchArgvSha256: argvSha256(oldArgs),
+    });
+
+    let spawnCalled = false;
+    const result = await ensureBackendReady({
+      config: currentConfig,
+      env: { HOME: home },
+      fetchImpl: async () => healthyResponse(),
+      spawnImpl: () => {
+        spawnCalled = true;
+        throw new Error('must not spawn');
+      },
+    });
+
+    assert.deepEqual(result, { ready: true, started: false, mode: 'reused-healthy' });
+    assert.equal(spawnCalled, false);
+    assert.equal(existsSync(layout.backendStatePath), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('healthy backend preserves and validates managed state replaced during the health check', async () => {
+  const home = tempHome('gl-c4-state-replaced-during-health-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    writeFileSync(serverPath, serverContent);
+    chmodSync(serverPath, 0o755);
+    writeFileSync(modelPath, modelContent);
+    writeLaunchConfig(layout, { serverPath, serverContent, modelPath, modelContent });
+
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: await exitedChildPid(),
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(currentArgs),
+    });
+
+    let spawnCalled = false;
+    const result = await ensureBackendReady({
+      config: currentConfig,
+      env: { HOME: home },
+      fetchImpl: async () => {
+        writeCurrentState(layout, {
+          pid: process.pid,
+          currentConfig,
+          serverPath,
+          serverContent,
+          modelPath,
+          modelContent,
+          launchArgvSha256: argvSha256(currentArgs),
+        });
+        return healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalled = true;
+        throw new Error('must not spawn');
+      },
+    });
+
+    assert.deepEqual(result, {
+      ready: true,
+      started: false,
+      mode: 'reused-healthy',
+      pid: process.pid,
+    });
+    assert.equal(spawnCalled, false);
+    assert.equal(existsSync(layout.backendStatePath), true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('healthy backend with live managed state still rejects a missing launch identity', async () => {
+  const home = tempHome('gl-c4-live-state-missing-launch-');
+  try {
+    const layout = resolveLayout({ HOME: home });
+    mkdirSync(layout.configDir, { recursive: true });
+    mkdirSync(layout.backendRuntimeDir, { recursive: true });
+
+    const serverPath = path.join(home, 'llama-server');
+    const modelPath = path.join(home, 'model.gguf');
+    const serverContent = '#!/bin/sh\nexit 0\n';
+    const modelContent = 'fake-gguf';
+    const currentConfig = fullConfig();
+    const currentArgs = buildManagedLlamaServerArgs({ modelPath }, currentConfig, endpoint);
+    writeCurrentState(layout, {
+      pid: process.pid,
+      currentConfig,
+      serverPath,
+      serverContent,
+      modelPath,
+      modelContent,
+      launchArgvSha256: argvSha256(currentArgs),
+    });
+    const stateBefore = readFileSync(layout.backendStatePath, 'utf8');
+
+    let spawnCalled = false;
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: currentConfig,
+        env: { HOME: home },
+        fetchImpl: async () => healthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) =>
+        error instanceof ManagedBackendError &&
+        error.category === 'MANAGED_STATE_CONFLICT' &&
+        String(error.message).includes('missing'),
+    );
+
+    assert.equal(spawnCalled, false);
+    assert.equal(readFileSync(layout.backendStatePath, 'utf8'), stateBefore);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

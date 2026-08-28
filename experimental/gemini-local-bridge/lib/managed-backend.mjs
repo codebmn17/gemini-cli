@@ -25,7 +25,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   constants as fsConstants,
   accessSync,
@@ -33,6 +33,7 @@ import {
   closeSync,
   fstatSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -359,8 +360,7 @@ function writeStateAtomic(statePath, state) {
   chmodSync(statePath, 0o600);
 }
 
-function readState(env) {
-  const { statePath } = runtimePaths(env);
+function readStatePath(statePath) {
   const text = readRegularFileNoFollow(statePath, MAX_MANAGED_FILE_BYTES, { absentOk: true });
   if (text === null) return null;
   const parsed = parseJsonObject(text, 'managed backend state');
@@ -375,6 +375,10 @@ function readState(env) {
   return parsed;
 }
 
+function readState(env) {
+  return readStatePath(runtimePaths(env).statePath);
+}
+
 function removeState(env) {
   const { statePath } = runtimePaths(env);
   try {
@@ -382,6 +386,45 @@ function removeState(env) {
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
+}
+
+function statesEqual(left, right) {
+  const keys = Object.keys(left);
+  return exactKeys(right, keys) && keys.every((key) => left[key] === right[key]);
+}
+
+function restoreClaimedState(claimedPath, statePath) {
+  try {
+    linkSync(claimedPath, statePath);
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+  unlinkSync(claimedPath);
+}
+
+function removeStateIfMatches(env, expectedState) {
+  const { statePath } = runtimePaths(env);
+  const claimedPath = `${statePath}.stale-${process.pid}-${randomUUID()}`;
+  try {
+    renameSync(statePath, claimedPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+
+  let claimedState;
+  try {
+    claimedState = readStatePath(claimedPath);
+  } catch (error) {
+    restoreClaimedState(claimedPath, statePath);
+    throw error;
+  }
+  if (!statesEqual(claimedState, expectedState)) {
+    restoreClaimedState(claimedPath, statePath);
+    return false;
+  }
+  unlinkSync(claimedPath);
+  return true;
 }
 
 function stateMatchesConfig(state, config, launch = null, args = null) {
@@ -521,7 +564,14 @@ export async function ensureBackendReady({
   const existingState = readState(env);
   const healthy = await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 });
   if (healthy) {
-    if (!existingState) {
+    let currentState = readState(env);
+    while (currentState && !isProcessAlive(currentState.pid)) {
+      if (removeStateIfMatches(env, currentState)) {
+        return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
+      }
+      currentState = readState(env);
+    }
+    if (!currentState) {
       return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
     }
 
@@ -534,21 +584,17 @@ export async function ensureBackendReady({
     }
     const endpoint = parseManagedEndpoint(config.backendOrigin);
     const expectedArgs = buildManagedLlamaServerArgs(launchIdentity, config, endpoint);
-    if (!stateMatchesConfig(existingState, config, launchIdentity, expectedArgs)) {
+    if (!stateMatchesConfig(currentState, config, launchIdentity, expectedArgs)) {
       fail(
         'MANAGED_STATE_CONFLICT',
         'healthy managed backend configuration or launch policy differs from the current launcher; use gemini-local restart',
       );
     }
-    if (!isProcessAlive(existingState.pid)) {
-      removeState(env);
-      return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
-    }
     return Object.freeze({
       ready: true,
       started: false,
       mode: 'reused-healthy',
-      pid: existingState.pid,
+      pid: currentState.pid,
     });
   }
 
