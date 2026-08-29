@@ -7,7 +7,9 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
+import fs from 'node:fs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -210,13 +212,12 @@ function readLaunchClaimText(layout) {
   return readFileSync(path.join(claimPath, entries[0]), 'utf8');
 }
 
-function writeLaunchClaim(layout, {
+function writeLaunchClaimDirectory(claimPath, {
   token = '11111111-1111-4111-8111-111111111111',
   ownerPid = process.pid,
   ownerProcStartTicks = null,
   createdAtMs = Date.now(),
 } = {}) {
-  const claimPath = launchClaimPath(layout);
   mkdirSync(claimPath, { mode: 0o700 });
   writeFileSync(
     path.join(claimPath, `owner-${token}.json`),
@@ -229,6 +230,10 @@ function writeLaunchClaim(layout, {
     }, null, 2)}\n`,
     { mode: 0o600 },
   );
+}
+
+function writeLaunchClaim(layout, options = {}) {
+  writeLaunchClaimDirectory(launchClaimPath(layout), options);
 }
 
 test('Android managed argv adds only the proven mobile-safe resource bounds', () => {
@@ -1025,6 +1030,133 @@ test('state publication failure preserves authoritative state and releases the l
     assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), authoritativeState);
     assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
   } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('claim release atomically hands off to a successor without false launch failure', async () => {
+  const fixture = createManagedFixture('gl-c4-atomic-claim-release-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const successorToken = '22222222-2222-4222-8222-222222222222';
+  const successorStagingPath = `${publicClaimPath}.tmp-test-${successorToken}`;
+  const originalRenameSync = fs.renameSync;
+  const originalRmdirSync = fs.rmdirSync;
+  let successorPublished = false;
+  let sawAtomicDetach = false;
+  let sawEmptyPublicClaim = false;
+
+  writeLaunchClaimDirectory(successorStagingPath, { token: successorToken });
+  const successorClaim = readFileSync(
+    path.join(successorStagingPath, `owner-${successorToken}.json`),
+    'utf8',
+  );
+
+  function publishSuccessor() {
+    assert.equal(existsSync(publicClaimPath), false);
+    originalRenameSync(successorStagingPath, publicClaimPath);
+    successorPublished = true;
+  }
+
+  fs.renameSync = (sourcePath, destinationPath) => {
+    if (
+      sourcePath === publicClaimPath &&
+      destinationPath.startsWith(`${publicClaimPath}.detached-`)
+    ) {
+      originalRenameSync(sourcePath, destinationPath);
+      sawAtomicDetach = true;
+      publishSuccessor();
+      return;
+    }
+    return originalRenameSync(sourcePath, destinationPath);
+  };
+  fs.rmdirSync = (targetPath, options) => {
+    if (
+      targetPath === publicClaimPath &&
+      existsSync(publicClaimPath) &&
+      readdirSync(publicClaimPath).length === 0
+    ) {
+      sawEmptyPublicClaim = true;
+      publishSuccessor();
+    }
+    return originalRmdirSync(targetPath, options);
+  };
+  syncBuiltinESMExports();
+
+  try {
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => fakeSpawnedChild(),
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(sawAtomicDetach, true);
+    assert.equal(sawEmptyPublicClaim, false);
+    assert.equal(successorPublished, true);
+    assert.equal(readLaunchClaimText(fixture.layout), successorClaim);
+    assert.equal(
+      readdirSync(fixture.layout.backendRuntimeDir).some((entry) => entry.includes('.detached-')),
+      false,
+    );
+    assert.equal(JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8')).pid, process.pid);
+  } finally {
+    fs.renameSync = originalRenameSync;
+    fs.rmdirSync = originalRmdirSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('detached claim cleanup failure does not overturn an authoritative launch', async () => {
+  const fixture = createManagedFixture('gl-c4-detached-cleanup-failure-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const originalRmdirSync = fs.rmdirSync;
+  let detachedCleanupAttempted = false;
+
+  fs.rmdirSync = (targetPath, options) => {
+    if (targetPath.startsWith(`${publicClaimPath}.detached-`)) {
+      detachedCleanupAttempted = true;
+      const error = new Error('synthetic detached cleanup failure');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return originalRmdirSync(targetPath, options);
+  };
+  syncBuiltinESMExports();
+
+  try {
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => fakeSpawnedChild(),
+      startupTimeoutMs: 5_000,
+    });
+
+    const detachedEntries = readdirSync(fixture.layout.backendRuntimeDir)
+      .filter((entry) => entry.includes('.detached-'));
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(detachedCleanupAttempted, true);
+    assert.equal(existsSync(publicClaimPath), false);
+    assert.equal(detachedEntries.length, 1);
+    assert.deepEqual(
+      readdirSync(path.join(fixture.layout.backendRuntimeDir, detachedEntries[0])),
+      [],
+    );
+    assert.equal(JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8')).pid, process.pid);
+  } finally {
+    fs.rmdirSync = originalRmdirSync;
+    syncBuiltinESMExports();
     rmSync(fixture.home, { recursive: true, force: true });
   }
 });

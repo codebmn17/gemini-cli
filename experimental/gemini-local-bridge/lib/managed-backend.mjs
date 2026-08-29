@@ -422,12 +422,12 @@ function parseLaunchClaim(text) {
   return parsed;
 }
 
-function readLaunchClaim(runtime) {
+function readLaunchClaimPath(claimPath, { absentOk = false } = {}) {
   let before;
   try {
-    before = lstatSync(runtime.claimPath);
+    before = lstatSync(claimPath);
   } catch (error) {
-    if (error?.code === 'ENOENT') return null;
+    if (absentOk && error?.code === 'ENOENT') return null;
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'unable to inspect the managed launch claim');
   }
   if (before.isSymbolicLink() || !before.isDirectory()) {
@@ -436,14 +436,14 @@ function readLaunchClaim(runtime) {
 
   let entries;
   try {
-    entries = readdirSync(runtime.claimPath);
+    entries = readdirSync(claimPath);
   } catch {
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'unable to read the managed launch claim');
   }
   if (entries.length !== 1 || !/^owner-[0-9a-f-]+\.json$/.test(entries[0])) {
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim directory is malformed');
   }
-  const text = readRegularFileNoFollow(path.join(runtime.claimPath, entries[0]), MAX_MANAGED_FILE_BYTES);
+  const text = readRegularFileNoFollow(path.join(claimPath, entries[0]), MAX_MANAGED_FILE_BYTES);
   const claim = parseLaunchClaim(text);
   if (entries[0] !== launchClaimRecordName(claim.token)) {
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim token does not match its owner record');
@@ -451,14 +451,18 @@ function readLaunchClaim(runtime) {
 
   let after;
   try {
-    after = lstatSync(runtime.claimPath);
+    after = lstatSync(claimPath);
   } catch {
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim changed while being read');
   }
   if (!after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim identity changed while being read');
   }
-  return claim;
+  return Object.freeze({ claim, dev: after.dev, ino: after.ino });
+}
+
+function readLaunchClaim(runtime) {
+  return readLaunchClaimPath(runtime.claimPath, { absentOk: true })?.claim ?? null;
 }
 
 function statesEqual(left, right) {
@@ -501,29 +505,42 @@ function removeStateIfMatches(env, expectedState) {
 }
 
 function removeLaunchClaimIfMatches(runtime, expectedClaim) {
-  let currentClaim;
-  try {
-    currentClaim = readLaunchClaim(runtime);
-  } catch (error) {
-    throw error;
-  }
-  if (!currentClaim || !statesEqual(currentClaim, expectedClaim)) return false;
+  const observed = readLaunchClaimPath(runtime.claimPath, { absentOk: true });
+  if (!observed || !statesEqual(observed.claim, expectedClaim)) return false;
 
-  const recordPath = path.join(runtime.claimPath, launchClaimRecordName(expectedClaim.token));
+  const detachedPath = `${runtime.claimPath}.detached-${expectedClaim.token}-${process.pid}-${randomUUID()}`;
   try {
-    unlinkSync(recordPath);
+    renameSync(runtime.claimPath, detachedPath);
   } catch (error) {
     if (error?.code === 'ENOENT') return false;
     throw error;
   }
-  try {
-    rmdirSync(runtime.claimPath);
-    return true;
-  } catch (error) {
-    if (error?.code === 'ENOENT') return true;
-    if (error?.code === 'ENOTEMPTY' || error?.code === 'EEXIST') return false;
-    throw error;
+
+  const detached = readLaunchClaimPath(detachedPath);
+  if (
+    detached.dev !== observed.dev ||
+    detached.ino !== observed.ino ||
+    !statesEqual(detached.claim, expectedClaim)
+  ) {
+    fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim ownership changed while being detached');
   }
+
+  const recordPath = path.join(detachedPath, launchClaimRecordName(expectedClaim.token));
+  try {
+    unlinkSync(recordPath);
+  } catch (error) {
+    // The owned claim is already detached from the public acquisition path.
+    // A private cleanup failure cannot affect a successor or invalidate state
+    // that was authoritatively published before release.
+    return true;
+  }
+  try {
+    rmdirSync(detachedPath);
+  } catch {
+    // The detached directory is token-specific and no longer participates in
+    // launch ownership, so leaving it behind is availability-neutral.
+  }
+  return true;
 }
 
 function launchClaimOwnerPlausiblyAlive(claim) {
