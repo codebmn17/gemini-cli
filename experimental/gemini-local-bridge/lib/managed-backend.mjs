@@ -60,6 +60,7 @@ export const MAX_MANAGED_FILE_BYTES = 16 * 1024;
 export const MANAGED_LAUNCH_CLAIM_STALE_MS = MAX_BACKEND_STARTUP_TIMEOUT_MS * 2;
 
 const MANAGED_LAUNCH_CLAIM_FILENAME = 'llama-server-launch-claim';
+const MAX_LAUNCH_CLAIM_ACQUIRE_RETRIES = 32;
 
 const LAUNCH_KEYS = Object.freeze([
   'schemaVersion',
@@ -110,6 +111,13 @@ export class ManagedBackendError extends Error {
     super(message);
     this.name = 'ManagedBackendError';
     this.category = category;
+  }
+}
+
+class LaunchClaimReadRetryError extends Error {
+  constructor() {
+    super('managed launch claim changed during public-path read');
+    this.name = 'LaunchClaimReadRetryError';
   }
 }
 
@@ -422,7 +430,21 @@ function parseLaunchClaim(text) {
   return parsed;
 }
 
-function readLaunchClaimPath(claimPath, { absentOk = false } = {}) {
+function retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange) {
+  if (!retryOnChange) return;
+  let current;
+  try {
+    current = lstatSync(claimPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw new LaunchClaimReadRetryError();
+    return;
+  }
+  if (current.dev !== before.dev || current.ino !== before.ino) {
+    throw new LaunchClaimReadRetryError();
+  }
+}
+
+function readLaunchClaimPath(claimPath, { absentOk = false, retryOnChange = false } = {}) {
   let before;
   try {
     before = lstatSync(claimPath);
@@ -431,6 +453,7 @@ function readLaunchClaimPath(claimPath, { absentOk = false } = {}) {
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'unable to inspect the managed launch claim');
   }
   if (before.isSymbolicLink() || !before.isDirectory()) {
+    retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim must be a non-symlink directory');
   }
 
@@ -438,31 +461,48 @@ function readLaunchClaimPath(claimPath, { absentOk = false } = {}) {
   try {
     entries = readdirSync(claimPath);
   } catch {
+    retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'unable to read the managed launch claim');
   }
   if (entries.length !== 1 || !/^owner-[0-9a-f-]+\.json$/.test(entries[0])) {
+    retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim directory is malformed');
   }
-  const text = readRegularFileNoFollow(path.join(claimPath, entries[0]), MAX_MANAGED_FILE_BYTES);
-  const claim = parseLaunchClaim(text);
+  let text;
+  try {
+    text = readRegularFileNoFollow(path.join(claimPath, entries[0]), MAX_MANAGED_FILE_BYTES);
+  } catch (error) {
+    retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
+    throw error;
+  }
+  let claim;
+  try {
+    claim = parseLaunchClaim(text);
+  } catch (error) {
+    retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
+    throw error;
+  }
   if (entries[0] !== launchClaimRecordName(claim.token)) {
+    retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim token does not match its owner record');
   }
 
   let after;
   try {
     after = lstatSync(claimPath);
-  } catch {
+  } catch (error) {
+    if (retryOnChange && error?.code === 'ENOENT') throw new LaunchClaimReadRetryError();
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim changed while being read');
   }
   if (!after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
+    if (retryOnChange) throw new LaunchClaimReadRetryError();
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim identity changed while being read');
   }
   return Object.freeze({ claim, dev: after.dev, ino: after.ino });
 }
 
 function readLaunchClaim(runtime) {
-  return readLaunchClaimPath(runtime.claimPath, { absentOk: true })?.claim ?? null;
+  return readLaunchClaimPath(runtime.claimPath, { absentOk: true, retryOnChange: true })?.claim ?? null;
 }
 
 function statesEqual(left, right) {
@@ -544,7 +584,7 @@ function removeLaunchClaimIfMatches(runtime, expectedClaim) {
 }
 
 function reclaimStaleLaunchClaimIfMatches(runtime, expectedClaim) {
-  const observed = readLaunchClaimPath(runtime.claimPath, { absentOk: true });
+  const observed = readLaunchClaimPath(runtime.claimPath, { absentOk: true, retryOnChange: true });
   if (!observed || !statesEqual(observed.claim, expectedClaim)) return false;
 
   // Stale reclamation can have multiple callers holding the same old
@@ -611,6 +651,7 @@ function acquireLaunchClaim(runtime) {
     createdAtMs: Date.now(),
   });
 
+  let acquisitionRetries = 0;
   while (true) {
     try {
       publishLaunchClaimExclusive(runtime, claim);
@@ -620,11 +661,18 @@ function acquireLaunchClaim(runtime) {
         fail('BACKEND_START_FAILED', 'unable to acquire the managed launch claim');
       }
     }
+    acquisitionRetries += 1;
+    if (acquisitionRetries > MAX_LAUNCH_CLAIM_ACQUIRE_RETRIES) {
+      fail('MANAGED_LAUNCH_IN_PROGRESS', 'managed launch claim changed repeatedly during acquisition');
+    }
 
     let existingClaim;
     try {
       existingClaim = readLaunchClaim(runtime);
     } catch (error) {
+      if (error instanceof LaunchClaimReadRetryError) {
+        continue;
+      }
       if (error instanceof ManagedBackendError) {
         fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim is invalid and cannot be recovered safely');
       }
@@ -640,7 +688,14 @@ function acquireLaunchClaim(runtime) {
     ) {
       fail('MANAGED_LAUNCH_IN_PROGRESS', 'another managed backend launch is already in progress');
     }
-    if (!reclaimStaleLaunchClaimIfMatches(runtime, existingClaim)) continue;
+    try {
+      if (!reclaimStaleLaunchClaimIfMatches(runtime, existingClaim)) continue;
+    } catch (error) {
+      if (error instanceof LaunchClaimReadRetryError) {
+        continue;
+      }
+      throw error;
+    }
   }
 }
 

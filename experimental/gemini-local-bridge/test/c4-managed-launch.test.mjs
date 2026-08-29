@@ -913,6 +913,272 @@ test('a fresh claim from a dead launcher is not recovered before the abandonment
   }
 });
 
+test('claim acquisition retries when release detaches between initial lstat and readdir', async () => {
+  const fixture = createManagedFixture('gl-c4-claim-read-readdir-handoff-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const detachedPath = `${publicClaimPath}.test-detached`;
+  const originalReaddirSync = fs.readdirSync;
+  const originalRenameSync = fs.renameSync;
+  let interposed = false;
+  let spawnCalls = 0;
+
+  try {
+    writeLaunchClaim(fixture.layout);
+    fs.readdirSync = (targetPath, options) => {
+      if (!interposed && targetPath === publicClaimPath) {
+        originalRenameSync(publicClaimPath, detachedPath);
+        rmSync(detachedPath, { recursive: true, force: true });
+        interposed = true;
+      }
+      return originalReaddirSync(targetPath, options);
+    };
+    syncBuiltinESMExports();
+
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(interposed, true);
+    assert.equal(spawnCalls, 1);
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(existsSync(publicClaimPath), false);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('claim acquisition retries a handoff before the observed owner file is read', async () => {
+  const fixture = createManagedFixture('gl-c4-claim-read-owner-handoff-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const originalLstatSync = fs.lstatSync;
+  const originalRenameSync = fs.renameSync;
+  const firstToken = '11111111-1111-4111-8111-111111111111';
+  const successorToken = '22222222-2222-4222-8222-222222222222';
+  const successorStagingPath = `${publicClaimPath}.tmp-test-${successorToken}`;
+  const firstOwnerPath = path.join(publicClaimPath, `owner-${firstToken}.json`);
+  let interposed = false;
+  let successorIdentity = null;
+  let spawnCalled = false;
+
+  try {
+    writeLaunchClaim(fixture.layout, { token: firstToken });
+    writeLaunchClaimDirectory(successorStagingPath, { token: successorToken });
+    const successorClaim = readFileSync(
+      path.join(successorStagingPath, `owner-${successorToken}.json`),
+      'utf8',
+    );
+
+    fs.lstatSync = (targetPath, options) => {
+      if (!interposed && targetPath === firstOwnerPath) {
+        const detachedPath = `${publicClaimPath}.test-detached-${firstToken}`;
+        originalRenameSync(publicClaimPath, detachedPath);
+        rmSync(detachedPath, { recursive: true, force: true });
+        originalRenameSync(successorStagingPath, publicClaimPath);
+        successorIdentity = originalLstatSync(publicClaimPath);
+        interposed = true;
+      }
+      return originalLstatSync(targetPath, options);
+    };
+    syncBuiltinESMExports();
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    const currentIdentity = originalLstatSync(publicClaimPath);
+    assert.equal(interposed, true);
+    assert.equal(spawnCalled, false);
+    assert.equal(currentIdentity.dev, successorIdentity.dev);
+    assert.equal(currentIdentity.ino, successorIdentity.ino);
+    assert.equal(readLaunchClaimText(fixture.layout), successorClaim);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('claim acquisition retries when a successor replaces the claim before final identity check', async () => {
+  const fixture = createManagedFixture('gl-c4-claim-read-final-handoff-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const originalLstatSync = fs.lstatSync;
+  const originalRenameSync = fs.renameSync;
+  const firstToken = '11111111-1111-4111-8111-111111111111';
+  const successorToken = '22222222-2222-4222-8222-222222222222';
+  const successorStagingPath = `${publicClaimPath}.tmp-test-${successorToken}`;
+  let publicClaimStats = 0;
+  let successorIdentity = null;
+  let spawnCalled = false;
+
+  try {
+    writeLaunchClaim(fixture.layout, { token: firstToken });
+    writeLaunchClaimDirectory(successorStagingPath, { token: successorToken });
+    const successorClaim = readFileSync(
+      path.join(successorStagingPath, `owner-${successorToken}.json`),
+      'utf8',
+    );
+
+    fs.lstatSync = (targetPath, options) => {
+      if (targetPath === publicClaimPath) {
+        publicClaimStats += 1;
+        if (publicClaimStats === 2) {
+          const detachedPath = `${publicClaimPath}.test-detached-${firstToken}`;
+          originalRenameSync(publicClaimPath, detachedPath);
+          rmSync(detachedPath, { recursive: true, force: true });
+          originalRenameSync(successorStagingPath, publicClaimPath);
+          successorIdentity = originalLstatSync(publicClaimPath);
+        }
+      }
+      return originalLstatSync(targetPath, options);
+    };
+    syncBuiltinESMExports();
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    const currentIdentity = originalLstatSync(publicClaimPath);
+    assert.equal(spawnCalled, false);
+    assert.equal(currentIdentity.dev, successorIdentity.dev);
+    assert.equal(currentIdentity.ino, successorIdentity.ino);
+    assert.equal(readLaunchClaimText(fixture.layout), successorClaim);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('a stably malformed public claim fails closed without a retry loop', async () => {
+  const fixture = createManagedFixture('gl-c4-stable-invalid-claim-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const originalReaddirSync = fs.readdirSync;
+  const token = '11111111-1111-4111-8111-111111111111';
+  let claimReads = 0;
+  let spawnCalled = false;
+
+  try {
+    writeLaunchClaim(fixture.layout, { token });
+    writeFileSync(path.join(publicClaimPath, `owner-${token}.json`), '{not-json\n');
+    fs.readdirSync = (targetPath, options) => {
+      if (targetPath === publicClaimPath) claimReads += 1;
+      return originalReaddirSync(targetPath, options);
+    };
+    syncBuiltinESMExports();
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_CLAIM_INVALID',
+    );
+
+    assert.equal(claimReads, 1);
+    assert.equal(spawnCalled, false);
+    assert.equal(existsSync(publicClaimPath), true);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('repeated stable stale-claim handoffs stop at the bounded acquisition retry limit', async () => {
+  const fixture = createManagedFixture('gl-c4-claim-read-bounded-retries-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const originalLstatSync = fs.lstatSync;
+  const originalRenameSync = fs.renameSync;
+  let publicClaimStats = 0;
+  let transitions = 0;
+  let spawnCalled = false;
+
+  try {
+    const deadOwnerPid = await exitedChildPid();
+    const staleCreatedAtMs = Date.now() - MANAGED_LAUNCH_CLAIM_STALE_MS - 60_000;
+    writeLaunchClaim(fixture.layout, { ownerPid: deadOwnerPid, createdAtMs: staleCreatedAtMs });
+    fs.lstatSync = (targetPath, options) => {
+      if (targetPath === publicClaimPath) {
+        publicClaimStats += 1;
+        if (publicClaimStats % 4 === 3) {
+          transitions += 1;
+          if (transitions > 40) throw new Error('unbounded claim-read retry loop');
+          const token = `${String(transitions).padStart(8, '0')}-0000-4000-8000-${String(transitions).padStart(12, '0')}`;
+          const stagingPath = `${publicClaimPath}.tmp-churn-${transitions}`;
+          const detachedPath = `${publicClaimPath}.detached-churn-${transitions}`;
+          writeLaunchClaimDirectory(stagingPath, {
+            token,
+            ownerPid: deadOwnerPid,
+            createdAtMs: staleCreatedAtMs,
+          });
+          originalRenameSync(publicClaimPath, detachedPath);
+          rmSync(detachedPath, { recursive: true, force: true });
+          originalRenameSync(stagingPath, publicClaimPath);
+        }
+      }
+      return originalLstatSync(targetPath, options);
+    };
+    syncBuiltinESMExports();
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    assert.equal(transitions, 32);
+    assert.equal(spawnCalled, false);
+    assert.equal(existsSync(publicClaimPath), true);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
 test('a provably abandoned launch claim is recovered before managed startup', async () => {
   const fixture = createManagedFixture('gl-c4-abandoned-launch-claim-');
   try {
@@ -1023,6 +1289,72 @@ test('a stale observer cannot detach a successor published by another reclaimer'
   } finally {
     fs.renameSync = originalRenameSync;
     fs.unlinkSync = originalUnlinkSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('stale reclamation retries when its public claim read overlaps a successor handoff', async () => {
+  const fixture = createManagedFixture('gl-c4-stale-read-successor-handoff-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const originalLstatSync = fs.lstatSync;
+  const originalRenameSync = fs.renameSync;
+  const staleToken = '11111111-1111-4111-8111-111111111111';
+  const successorToken = '22222222-2222-4222-8222-222222222222';
+  const staleOwnerPath = path.join(publicClaimPath, `owner-${staleToken}.json`);
+  const successorStagingPath = `${publicClaimPath}.tmp-test-${successorToken}`;
+  let staleOwnerStats = 0;
+  let successorIdentity = null;
+  let spawnCalled = false;
+
+  try {
+    writeLaunchClaim(fixture.layout, {
+      token: staleToken,
+      ownerPid: await exitedChildPid(),
+      createdAtMs: Date.now() - MANAGED_LAUNCH_CLAIM_STALE_MS - 60_000,
+    });
+    writeLaunchClaimDirectory(successorStagingPath, { token: successorToken });
+    const successorClaim = readFileSync(
+      path.join(successorStagingPath, `owner-${successorToken}.json`),
+      'utf8',
+    );
+
+    fs.lstatSync = (targetPath, options) => {
+      if (targetPath === staleOwnerPath) {
+        staleOwnerStats += 1;
+        if (staleOwnerStats === 2) {
+          const detachedPath = `${publicClaimPath}.simulated-first-reclaimer`;
+          originalRenameSync(publicClaimPath, detachedPath);
+          rmSync(detachedPath, { recursive: true, force: true });
+          originalRenameSync(successorStagingPath, publicClaimPath);
+          successorIdentity = originalLstatSync(publicClaimPath);
+        }
+      }
+      return originalLstatSync(targetPath, options);
+    };
+    syncBuiltinESMExports();
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    const currentIdentity = originalLstatSync(publicClaimPath);
+    assert.equal(staleOwnerStats, 2);
+    assert.equal(spawnCalled, false);
+    assert.equal(currentIdentity.dev, successorIdentity.dev);
+    assert.equal(currentIdentity.ino, successorIdentity.ino);
+    assert.equal(readLaunchClaimText(fixture.layout), successorClaim);
+  } finally {
+    fs.lstatSync = originalLstatSync;
     syncBuiltinESMExports();
     rmSync(fixture.home, { recursive: true, force: true });
   }
