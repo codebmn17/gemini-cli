@@ -543,6 +543,31 @@ function removeLaunchClaimIfMatches(runtime, expectedClaim) {
   return true;
 }
 
+function reclaimStaleLaunchClaimIfMatches(runtime, expectedClaim) {
+  const observed = readLaunchClaimPath(runtime.claimPath, { absentOk: true });
+  if (!observed || !statesEqual(observed.claim, expectedClaim)) return false;
+
+  // Stale reclamation can have multiple callers holding the same old
+  // observation. Claim the exact UUID-named owner entry first so an obsolete
+  // caller cannot mutate a successor directory that has a different token.
+  const recordPath = path.join(runtime.claimPath, launchClaimRecordName(expectedClaim.token));
+  try {
+    unlinkSync(recordPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+
+  try {
+    rmdirSync(runtime.claimPath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return true;
+    if (error?.code === 'ENOTEMPTY' || error?.code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
 function launchClaimOwnerPlausiblyAlive(claim) {
   if (!isProcessAlive(claim.ownerPid)) return false;
   if (supportsProcOwnershipVerification() && claim.ownerProcStartTicks !== null) {
@@ -615,7 +640,7 @@ function acquireLaunchClaim(runtime) {
     ) {
       fail('MANAGED_LAUNCH_IN_PROGRESS', 'another managed backend launch is already in progress');
     }
-    if (!removeLaunchClaimIfMatches(runtime, existingClaim)) continue;
+    if (!reclaimStaleLaunchClaimIfMatches(runtime, existingClaim)) continue;
   }
 }
 
