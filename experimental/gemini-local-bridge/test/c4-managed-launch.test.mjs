@@ -4,7 +4,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import fs from 'node:fs';
@@ -224,8 +224,61 @@ function denyHardLinks() {
   });
 }
 
+function runPublicationWindowProbe(operation, fixture) {
+  const moduleUrl = new URL('../lib/managed-backend.mjs', import.meta.url).href;
+  const source = `
+    import {
+      ensureBackendReady,
+      getBackendStatus,
+      restartManagedBackend,
+      stopManagedBackend,
+    } from ${JSON.stringify(moduleUrl)};
+    const config = ${JSON.stringify(fixture.currentConfig)};
+    const env = { HOME: ${JSON.stringify(fixture.home)} };
+    const unhealthy = async () => new Response(JSON.stringify({ status: 'loading' }), {
+      status: 503,
+      headers: { 'content-type': 'application/json' },
+    });
+    let spawnCalls = 0;
+    let result;
+    try {
+      if (${JSON.stringify(operation)} === 'status') {
+        result = await getBackendStatus({ config, env, fetchImpl: unhealthy });
+      } else if (${JSON.stringify(operation)} === 'ensure') {
+        result = await ensureBackendReady({
+          config,
+          env,
+          fetchImpl: unhealthy,
+          spawnImpl: () => {
+            spawnCalls += 1;
+            throw new Error('publication-window probe must not spawn');
+          },
+        });
+      } else if (${JSON.stringify(operation)} === 'stop') {
+        result = await stopManagedBackend({ config, env });
+      } else {
+        result = await restartManagedBackend({ config, env, fetchImpl: unhealthy });
+      }
+      process.stdout.write(JSON.stringify({ result, spawnCalls }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ category: error?.category, message: error?.message, spawnCalls }));
+    }
+  `;
+  const probe = spawnSync(process.execPath, ['--input-type=module', '-e', source], {
+    encoding: 'utf8',
+    timeout: 5_000,
+  });
+  assert.equal(probe.status, 0, probe.stderr);
+  return JSON.parse(probe.stdout);
+}
+
 function launchClaimPath(layout) {
   return path.join(layout.backendRuntimeDir, 'llama-server-launch-claim');
+}
+
+function statePublicationMarkerEntries(layout) {
+  return readdirSync(layout.backendRuntimeDir)
+    .filter((entry) => entry.startsWith('llama-server-state-publication-'));
 }
 
 function readLaunchClaimText(layout) {
@@ -1861,6 +1914,180 @@ test('managed state publication does not require hard-link support', async () =>
   }
 });
 
+test('lifecycle commands treat an incomplete state owned by a live launch claimant as transitional', async () => {
+  const fixture = createManagedFixture('gl-c4-state-publication-window-');
+  const originalOpenSync = fs.openSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  let stateFd = null;
+  let preOpenStatusProbe = null;
+  let publicationProbes = null;
+  let spawnCalls = 0;
+
+  fs.openSync = (targetPath, flags, mode) => {
+    if (
+      targetPath === fixture.layout.backendStatePath &&
+      (flags & fs.constants.O_EXCL) !== 0 &&
+      preOpenStatusProbe === null
+    ) {
+      preOpenStatusProbe = runPublicationWindowProbe('status', fixture);
+    }
+    const fd = originalOpenSync(targetPath, flags, mode);
+    if (
+      targetPath === fixture.layout.backendStatePath &&
+      (flags & fs.constants.O_EXCL) !== 0
+    ) {
+      stateFd = fd;
+    }
+    return fd;
+  };
+  fs.writeFileSync = (targetPath, data, options) => {
+    if (targetPath === stateFd && publicationProbes === null) {
+      publicationProbes = Object.freeze({
+        status: runPublicationWindowProbe('status', fixture),
+        ensure: runPublicationWindowProbe('ensure', fixture),
+        stop: runPublicationWindowProbe('stop', fixture),
+        restart: runPublicationWindowProbe('restart', fixture),
+      });
+    }
+    return originalWriteFileSync(targetPath, data, options);
+  };
+  syncBuiltinESMExports();
+
+  try {
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(spawnCalls, 1);
+    assert.equal(preOpenStatusProbe?.result?.status, 'managed-launch-in-progress');
+    assert.equal(publicationProbes?.status?.result?.status, 'managed-launch-in-progress');
+    for (const operation of ['ensure', 'stop', 'restart']) {
+      assert.equal(
+        publicationProbes?.[operation]?.category,
+        'MANAGED_STATE_PUBLICATION_IN_PROGRESS',
+      );
+      assert.equal(publicationProbes?.[operation]?.spawnCalls, 0);
+    }
+    assert.equal(JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8')).pid, process.pid);
+    assert.deepEqual(statePublicationMarkerEntries(fixture.layout), []);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.writeFileSync = originalWriteFileSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('state read retries after publication completes during a partial snapshot', async () => {
+  const fixture = createManagedFixture('gl-c4-state-publication-handoff-');
+  const originalLstatSync = fs.lstatSync;
+  const originalReadSync = fs.readSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  const completeStateText = `${JSON.stringify({
+    schemaVersion: 1,
+    pid: process.pid,
+    procStartTicks: null,
+    backendOrigin: fixture.currentConfig.backendOrigin,
+    backendModel: fixture.currentConfig.backendModel,
+    serverPath: fixture.serverPath,
+    serverSha256: sha256(fixture.serverContent),
+    modelPath: fixture.modelPath,
+    modelSha256: sha256(fixture.modelContent),
+    startedAt: new Date().toISOString(),
+    launchArgvSha256: argvSha256(fixture.currentArgs),
+  })}\n`;
+  let transitionStarted = false;
+  let transitionCompleted = false;
+
+  fs.lstatSync = (targetPath) => {
+    if (targetPath === fixture.layout.backendStatePath && !transitionStarted) {
+      transitionStarted = true;
+      writeLaunchClaim(fixture.layout);
+      originalWriteFileSync(targetPath, '{"schemaVersion":');
+    }
+    return originalLstatSync(targetPath);
+  };
+  fs.readSync = (fd, buffer, offset, length, position) => {
+    const bytesRead = originalReadSync(fd, buffer, offset, length, position);
+    if (transitionStarted && !transitionCompleted) {
+      transitionCompleted = true;
+      originalWriteFileSync(fixture.layout.backendStatePath, completeStateText);
+      rmSync(launchClaimPath(fixture.layout), { recursive: true, force: true });
+    }
+    return bytesRead;
+  };
+  syncBuiltinESMExports();
+
+  try {
+    const status = await getBackendStatus({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => unhealthyResponse(),
+    });
+
+    assert.equal(transitionStarted, true);
+    assert.equal(transitionCompleted, true);
+    assert.equal(status.status, 'managed-unhealthy');
+    assert.equal(status.pid, process.pid);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    fs.readSync = originalReadSync;
+    fs.writeFileSync = originalWriteFileSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('abandoned partial state is invalid when its publication claimant is dead', async () => {
+  const fixture = createManagedFixture('gl-c4-state-publication-abandoned-');
+  try {
+    const deadPid = await exitedChildPid();
+    const token = '11111111-1111-4111-8111-111111111111';
+    writeFileSync(fixture.layout.backendStatePath, '');
+    writeLaunchClaim(fixture.layout, { token, ownerPid: deadPid });
+    mkdirSync(
+      path.join(fixture.layout.backendRuntimeDir, `llama-server-state-publication-${token}`),
+      { mode: 0o700 },
+    );
+
+    const status = await getBackendStatus({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => unhealthyResponse(),
+    });
+    assert.equal(status.status, 'state-invalid');
+
+    let spawnCalls = 0;
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalls += 1;
+          return fakeSpawnedChild();
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_CONFIG_INVALID',
+    );
+    assert.equal(spawnCalls, 0);
+  } finally {
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
 test('state publication failure preserves authoritative state and releases the launch claim', async () => {
   const fixture = createManagedFixture('gl-c4-publication-claim-cleanup-');
   const hardLinks = denyHardLinks();
@@ -1916,8 +2143,13 @@ test('state publication failure preserves authoritative state and releases the l
 test('managed state rollback restores without hard links when the public path remains absent', async () => {
   const fixture = createManagedFixture('gl-c4-restore-no-hardlink-');
   const hardLinks = denyHardLinks();
+  const originalOpenSync = fs.openSync;
   const originalRenameSync = fs.renameSync;
+  const originalWriteFileSync = fs.writeFileSync;
   let restoredText = null;
+  let rollbackStateFd = null;
+  let rollbackPreRestoreProbe = null;
+  let rollbackStatusProbe = null;
 
   try {
     const deadPid = await exitedChildPid();
@@ -1937,12 +2169,29 @@ test('managed state rollback restores without hard links when the public path re
         sourcePath === fixture.layout.backendStatePath &&
         destinationPath.startsWith(`${fixture.layout.backendStatePath}.stale-`)
       ) {
+        rollbackPreRestoreProbe = runPublicationWindowProbe('status', fixture);
         const replacement = JSON.parse(readFileSync(destinationPath, 'utf8'));
         replacement.pid = process.pid;
         replacement.startedAt = '2000-01-01T00:00:00.000Z';
         restoredText = `${JSON.stringify(replacement)}\n`;
         writeFileSync(destinationPath, restoredText);
       }
+    };
+    fs.openSync = (targetPath, flags, mode) => {
+      const fd = originalOpenSync(targetPath, flags, mode);
+      if (
+        targetPath === fixture.layout.backendStatePath &&
+        (flags & fs.constants.O_EXCL) !== 0
+      ) {
+        rollbackStateFd = fd;
+      }
+      return fd;
+    };
+    fs.writeFileSync = (targetPath, data, options) => {
+      if (targetPath === rollbackStateFd && rollbackStatusProbe === null) {
+        rollbackStatusProbe = runPublicationWindowProbe('status', fixture);
+      }
+      return originalWriteFileSync(targetPath, data, options);
     };
     syncBuiltinESMExports();
 
@@ -1957,14 +2206,19 @@ test('managed state rollback restores without hard links when the public path re
 
     assert.equal(result.mode, 'reused-healthy');
     assert.equal(result.pid, process.pid);
+    assert.equal(rollbackPreRestoreProbe?.result?.status, 'managed-launch-in-progress');
+    assert.equal(rollbackStatusProbe?.result?.status, 'managed-launch-in-progress');
     assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), restoredText);
     assert.equal(hardLinks.calls, 0);
+    assert.deepEqual(statePublicationMarkerEntries(fixture.layout), []);
     assert.deepEqual(
       readdirSync(fixture.layout.backendRuntimeDir).filter((entry) => entry.includes('.stale-')),
       [],
     );
   } finally {
+    fs.openSync = originalOpenSync;
     fs.renameSync = originalRenameSync;
+    fs.writeFileSync = originalWriteFileSync;
     syncBuiltinESMExports();
     hardLinks.restore();
     rmSync(fixture.home, { recursive: true, force: true });
@@ -2102,6 +2356,22 @@ test('partial exclusive state write fails closed and cleans up the spawned child
     });
     assert.equal(status.status, 'state-invalid');
     assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+    assert.deepEqual(statePublicationMarkerEntries(fixture.layout), []);
+
+    let stableSpawnCalls = 0;
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          stableSpawnCalls += 1;
+          return fakeSpawnedChild();
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_CONFIG_INVALID',
+    );
+    assert.equal(stableSpawnCalls, 0);
   } finally {
     fs.openSync = originalOpenSync;
     fs.writeFileSync = originalWriteFileSync;
