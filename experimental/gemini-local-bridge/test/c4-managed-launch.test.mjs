@@ -201,6 +201,29 @@ function fakeSpawnedChild(pid = process.pid) {
   return child;
 }
 
+function denyHardLinks() {
+  const originalLinkSync = fs.linkSync;
+  let calls = 0;
+  fs.linkSync = () => {
+    calls += 1;
+    const error = new Error('EACCES: permission denied, link');
+    error.code = 'EACCES';
+    error.errno = -13;
+    error.syscall = 'link';
+    throw error;
+  };
+  syncBuiltinESMExports();
+  return Object.freeze({
+    get calls() {
+      return calls;
+    },
+    restore() {
+      fs.linkSync = originalLinkSync;
+      syncBuiltinESMExports();
+    },
+  });
+}
+
 function launchClaimPath(layout) {
   return path.join(layout.backendRuntimeDir, 'llama-server-launch-claim');
 }
@@ -1795,11 +1818,57 @@ test('spawn failure releases the owned launch claim and permits a later launch',
   }
 });
 
+test('managed state publication does not require hard-link support', async () => {
+  const fixture = createManagedFixture('gl-c4-no-hardlink-state-');
+  const hardLinks = denyHardLinks();
+  let spawnedChild = null;
+  let childClosed = null;
+  let spawnCalls = 0;
+
+  try {
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        spawnedChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+          stdio: 'ignore',
+        });
+        childClosed = once(spawnedChild, 'close');
+        return spawnedChild;
+      },
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(spawnCalls, 1);
+    assert.equal(hardLinks.calls, 0);
+    const state = JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8'));
+    assert.equal(state.schemaVersion, 1);
+    assert.equal(state.pid, spawnedChild.pid);
+    assert.equal(state.serverPath, fixture.serverPath);
+    assert.equal(state.modelPath, fixture.modelPath);
+  } finally {
+    hardLinks.restore();
+    if (spawnedChild?.exitCode === null) spawnedChild.kill('SIGTERM');
+    if (childClosed) await childClosed;
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
 test('state publication failure preserves authoritative state and releases the launch claim', async () => {
   const fixture = createManagedFixture('gl-c4-publication-claim-cleanup-');
+  const hardLinks = denyHardLinks();
+  let spawnedChild = null;
+  let childClosed = null;
   try {
-    const deadChildPid = await exitedChildPid();
     let authoritativeState = null;
+    let authoritativeIdentity = null;
 
     await assert.rejects(
       () => ensureBackendReady({
@@ -1817,15 +1886,228 @@ test('state publication failure preserves authoritative state and releases the l
             launchArgvSha256: argvSha256(fixture.currentArgs),
           });
           authoritativeState = readFileSync(fixture.layout.backendStatePath, 'utf8');
-          return fakeSpawnedChild(deadChildPid);
+          const stat = lstatSync(fixture.layout.backendStatePath);
+          authoritativeIdentity = { dev: stat.dev, ino: stat.ino };
+          spawnedChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+            stdio: 'ignore',
+          });
+          childClosed = once(spawnedChild, 'close');
+          return spawnedChild;
         },
       }),
       (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_FAILED',
     );
+    await childClosed;
 
     assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), authoritativeState);
+    const after = lstatSync(fixture.layout.backendStatePath);
+    assert.deepEqual({ dev: after.dev, ino: after.ino }, authoritativeIdentity);
+    assert.equal(hardLinks.calls, 0);
+    assert.equal(spawnedChild.signalCode, 'SIGTERM');
     assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
   } finally {
+    hardLinks.restore();
+    if (spawnedChild?.exitCode === null) spawnedChild.kill('SIGTERM');
+    if (childClosed && spawnedChild?.exitCode === null) await childClosed;
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('managed state rollback restores without hard links when the public path remains absent', async () => {
+  const fixture = createManagedFixture('gl-c4-restore-no-hardlink-');
+  const hardLinks = denyHardLinks();
+  const originalRenameSync = fs.renameSync;
+  let restoredText = null;
+
+  try {
+    const deadPid = await exitedChildPid();
+    writeCurrentState(fixture.layout, {
+      pid: deadPid,
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    fs.renameSync = (sourcePath, destinationPath) => {
+      originalRenameSync(sourcePath, destinationPath);
+      if (
+        sourcePath === fixture.layout.backendStatePath &&
+        destinationPath.startsWith(`${fixture.layout.backendStatePath}.stale-`)
+      ) {
+        const replacement = JSON.parse(readFileSync(destinationPath, 'utf8'));
+        replacement.pid = process.pid;
+        replacement.startedAt = '2000-01-01T00:00:00.000Z';
+        restoredText = `${JSON.stringify(replacement)}\n`;
+        writeFileSync(destinationPath, restoredText);
+      }
+    };
+    syncBuiltinESMExports();
+
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => healthyResponse(),
+      spawnImpl: () => {
+        throw new Error('must not spawn');
+      },
+    });
+
+    assert.equal(result.mode, 'reused-healthy');
+    assert.equal(result.pid, process.pid);
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), restoredText);
+    assert.equal(hardLinks.calls, 0);
+    assert.deepEqual(
+      readdirSync(fixture.layout.backendRuntimeDir).filter((entry) => entry.includes('.stale-')),
+      [],
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
+    syncBuiltinESMExports();
+    hardLinks.restore();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('managed state rollback preserves a concurrently published successor without hard links', async () => {
+  const fixture = createManagedFixture('gl-c4-restore-successor-no-hardlink-');
+  const hardLinks = denyHardLinks();
+  const originalRenameSync = fs.renameSync;
+  let successorText = null;
+  let successorIdentity = null;
+
+  try {
+    const deadPid = await exitedChildPid();
+    writeCurrentState(fixture.layout, {
+      pid: deadPid,
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    fs.renameSync = (sourcePath, destinationPath) => {
+      originalRenameSync(sourcePath, destinationPath);
+      if (
+        sourcePath === fixture.layout.backendStatePath &&
+        destinationPath.startsWith(`${fixture.layout.backendStatePath}.stale-`)
+      ) {
+        const replacement = JSON.parse(readFileSync(destinationPath, 'utf8'));
+        replacement.pid = process.pid;
+        replacement.startedAt = '2000-01-01T00:00:00.000Z';
+        writeFileSync(destinationPath, `${JSON.stringify(replacement)}\n`);
+        writeCurrentState(fixture.layout, {
+          pid: process.pid,
+          currentConfig: fixture.currentConfig,
+          serverPath: fixture.serverPath,
+          serverContent: fixture.serverContent,
+          modelPath: fixture.modelPath,
+          modelContent: fixture.modelContent,
+          launchArgvSha256: argvSha256(fixture.currentArgs),
+        });
+        successorText = readFileSync(fixture.layout.backendStatePath, 'utf8');
+        const stat = lstatSync(fixture.layout.backendStatePath);
+        successorIdentity = { dev: stat.dev, ino: stat.ino };
+      }
+    };
+    syncBuiltinESMExports();
+
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => healthyResponse(),
+      spawnImpl: () => {
+        throw new Error('must not spawn');
+      },
+    });
+
+    assert.equal(result.mode, 'reused-healthy');
+    assert.equal(result.pid, process.pid);
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), successorText);
+    const after = lstatSync(fixture.layout.backendStatePath);
+    assert.deepEqual({ dev: after.dev, ino: after.ino }, successorIdentity);
+    assert.equal(hardLinks.calls, 0);
+    assert.deepEqual(
+      readdirSync(fixture.layout.backendRuntimeDir).filter((entry) => entry.includes('.stale-')),
+      [],
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
+    syncBuiltinESMExports();
+    hardLinks.restore();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('partial exclusive state write fails closed and cleans up the spawned child', async () => {
+  const fixture = createManagedFixture('gl-c4-partial-state-write-');
+  const originalOpenSync = fs.openSync;
+  const originalWriteFileSync = fs.writeFileSync;
+  let spawnedChild = null;
+  let childClosed = null;
+  let injectedFailure = false;
+  let stateFd = null;
+
+  fs.openSync = (targetPath, flags, mode) => {
+    const fd = originalOpenSync(targetPath, flags, mode);
+    if (
+      targetPath === fixture.layout.backendStatePath &&
+      (flags & fs.constants.O_EXCL) !== 0
+    ) {
+      stateFd = fd;
+    }
+    return fd;
+  };
+  fs.writeFileSync = (targetPath, data, options) => {
+    if (!injectedFailure && targetPath === stateFd) {
+      injectedFailure = true;
+      originalWriteFileSync(targetPath, '{"schemaVersion":');
+      const error = new Error('synthetic partial state write failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalWriteFileSync(targetPath, data, options);
+  };
+  syncBuiltinESMExports();
+
+  try {
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnedChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+            stdio: 'ignore',
+          });
+          childClosed = once(spawnedChild, 'close');
+          return spawnedChild;
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_FAILED',
+    );
+    await childClosed;
+
+    assert.equal(injectedFailure, true);
+    assert.equal(spawnedChild.signalCode, 'SIGTERM');
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), '');
+    const status = await getBackendStatus({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => unhealthyResponse(),
+    });
+    assert.equal(status.status, 'state-invalid');
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.writeFileSync = originalWriteFileSync;
+    syncBuiltinESMExports();
+    if (spawnedChild?.exitCode === null) spawnedChild.kill('SIGTERM');
+    if (childClosed && spawnedChild?.exitCode === null) await childClosed;
     rmSync(fixture.home, { recursive: true, force: true });
   }
 });

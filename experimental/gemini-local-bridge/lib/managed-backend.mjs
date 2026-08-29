@@ -32,8 +32,9 @@ import {
   chmodSync,
   closeSync,
   fstatSync,
+  fsyncSync,
+  ftruncateSync,
   lstatSync,
-  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -374,14 +375,43 @@ function buildState({ pid, config, launch, args }) {
   });
 }
 
-function publishJsonExclusive(targetPath, value) {
-  const temp = `${targetPath}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+function writeTextExclusive(targetPath, text) {
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  const fd = openSync(
+    targetPath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+    0o600,
+  );
+  let published = false;
+  let writeError = null;
   try {
-    linkSync(temp, targetPath);
+    writeFileSync(fd, text);
+    fsyncSync(fd);
+    published = true;
+  } catch (error) {
+    writeError = error;
+    // Keep any exclusively created inode detectably invalid. Truncating by
+    // descriptor cannot damage a successor that replaced the public path.
+    try {
+      ftruncateSync(fd, 0);
+      fsyncSync(fd);
+    } catch {
+      // The public reader still validates JSON/schema and fails closed.
+    }
   } finally {
-    unlinkSync(temp);
+    try {
+      closeSync(fd);
+    } catch (error) {
+      // A fully written and fsynced state is authoritative even if close
+      // reports an error; on write failure preserve the original cause.
+      if (!published && !writeError) writeError = error;
+    }
   }
+  if (writeError) throw writeError;
+}
+
+function publishJsonExclusive(targetPath, value) {
+  writeTextExclusive(targetPath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function writeStateAtomic(statePath, state) {
@@ -523,10 +553,16 @@ function statesEqual(left, right) {
 }
 
 function restoreClaimedState(claimedPath, statePath) {
+  const claimedText = readRegularFileNoFollow(claimedPath, MAX_MANAGED_FILE_BYTES);
   try {
-    linkSync(claimedPath, statePath);
+    writeTextExclusive(statePath, claimedText);
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error;
+    // An exclusively published successor wins. Validate it before discarding
+    // the private rollback copy so malformed/symlink replacements fail closed.
+    if (!readStatePath(statePath)) {
+      fail('MANAGED_STATE_INVALID', 'managed backend state changed during rollback');
+    }
   }
   unlinkSync(claimedPath);
 }
