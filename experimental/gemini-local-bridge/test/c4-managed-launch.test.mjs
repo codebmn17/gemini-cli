@@ -1120,6 +1120,317 @@ test('a stably malformed public claim fails closed without a retry loop', async 
   }
 });
 
+test('an empty stale-reclamation window retries and preserves a published successor', async () => {
+  const fixture = createManagedFixture('gl-c4-empty-claim-successor-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const staleToken = '11111111-1111-4111-8111-111111111111';
+  const successorToken = '22222222-2222-4222-8222-222222222222';
+  const successorStagingPath = `${publicClaimPath}.tmp-test-${successorToken}`;
+  const originalReaddirSync = fs.readdirSync;
+  const originalRenameSync = fs.renameSync;
+  const originalUnlinkSync = fs.unlinkSync;
+  let emptyObserved = false;
+  let successorPublished = false;
+  let successorIdentity = null;
+  let spawnCalled = false;
+
+  try {
+    writeLaunchClaim(fixture.layout, {
+      token: staleToken,
+      ownerPid: await exitedChildPid(),
+      createdAtMs: Date.now() - MANAGED_LAUNCH_CLAIM_STALE_MS - 60_000,
+    });
+    writeLaunchClaimDirectory(successorStagingPath, { token: successorToken });
+    const successorClaim = readFileSync(
+      path.join(successorStagingPath, `owner-${successorToken}.json`),
+      'utf8',
+    );
+
+    fs.readdirSync = (targetPath, options) => {
+      if (!emptyObserved && targetPath === publicClaimPath) {
+        originalUnlinkSync(path.join(publicClaimPath, `owner-${staleToken}.json`));
+        const entries = originalReaddirSync(targetPath, options);
+        assert.deepEqual(entries, []);
+        emptyObserved = true;
+        return entries;
+      }
+      return originalReaddirSync(targetPath, options);
+    };
+    fs.renameSync = (sourcePath, destinationPath) => {
+      if (
+        emptyObserved &&
+        !successorPublished &&
+        sourcePath.startsWith(`${publicClaimPath}.tmp-${process.pid}-`) &&
+        destinationPath === publicClaimPath
+      ) {
+        originalRenameSync(successorStagingPath, publicClaimPath);
+        successorIdentity = lstatSync(publicClaimPath);
+        successorPublished = true;
+      }
+      return originalRenameSync(sourcePath, destinationPath);
+    };
+    syncBuiltinESMExports();
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    const currentIdentity = lstatSync(publicClaimPath);
+    assert.equal(emptyObserved, true);
+    assert.equal(successorPublished, true);
+    assert.equal(spawnCalled, false);
+    assert.equal(currentIdentity.dev, successorIdentity.dev);
+    assert.equal(currentIdentity.ino, successorIdentity.ino);
+    assert.equal(readLaunchClaimText(fixture.layout), successorClaim);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+    fs.renameSync = originalRenameSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('an empty stale-reclamation window retries after the old directory is removed', async () => {
+  const fixture = createManagedFixture('gl-c4-empty-claim-removed-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const staleToken = '11111111-1111-4111-8111-111111111111';
+  const originalReaddirSync = fs.readdirSync;
+  const originalRenameSync = fs.renameSync;
+  const originalRmdirSync = fs.rmdirSync;
+  const originalUnlinkSync = fs.unlinkSync;
+  let emptyObserved = false;
+  let staleCleanupFinished = false;
+  let spawnCalls = 0;
+
+  try {
+    writeLaunchClaim(fixture.layout, {
+      token: staleToken,
+      ownerPid: await exitedChildPid(),
+      createdAtMs: Date.now() - MANAGED_LAUNCH_CLAIM_STALE_MS - 60_000,
+    });
+
+    fs.readdirSync = (targetPath, options) => {
+      if (!emptyObserved && targetPath === publicClaimPath) {
+        originalUnlinkSync(path.join(publicClaimPath, `owner-${staleToken}.json`));
+        const entries = originalReaddirSync(targetPath, options);
+        assert.deepEqual(entries, []);
+        emptyObserved = true;
+        return entries;
+      }
+      return originalReaddirSync(targetPath, options);
+    };
+    fs.renameSync = (sourcePath, destinationPath) => {
+      if (
+        emptyObserved &&
+        !staleCleanupFinished &&
+        sourcePath.startsWith(`${publicClaimPath}.tmp-${process.pid}-`) &&
+        destinationPath === publicClaimPath
+      ) {
+        originalRmdirSync(publicClaimPath);
+        staleCleanupFinished = true;
+      }
+      return originalRenameSync(sourcePath, destinationPath);
+    };
+    syncBuiltinESMExports();
+
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(emptyObserved, true);
+    assert.equal(staleCleanupFinished, true);
+    assert.equal(spawnCalls, 1);
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(existsSync(publicClaimPath), false);
+    assert.equal(JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8')).pid, process.pid);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+    fs.renameSync = originalRenameSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('owner-file disappearance into the same empty stale directory retries acquisition', async () => {
+  const fixture = createManagedFixture('gl-c4-empty-claim-owner-disappears-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const staleToken = '11111111-1111-4111-8111-111111111111';
+  const staleOwnerPath = path.join(publicClaimPath, `owner-${staleToken}.json`);
+  const originalLstatSync = fs.lstatSync;
+  const originalUnlinkSync = fs.unlinkSync;
+  let ownerRemoved = false;
+  let emptyIdentity = null;
+  let spawnCalls = 0;
+
+  try {
+    writeLaunchClaim(fixture.layout, {
+      token: staleToken,
+      ownerPid: await exitedChildPid(),
+      createdAtMs: Date.now() - MANAGED_LAUNCH_CLAIM_STALE_MS - 60_000,
+    });
+    const originalIdentity = originalLstatSync(publicClaimPath);
+
+    fs.lstatSync = (targetPath, options) => {
+      if (!ownerRemoved && targetPath === staleOwnerPath) {
+        originalUnlinkSync(staleOwnerPath);
+        emptyIdentity = originalLstatSync(publicClaimPath);
+        ownerRemoved = true;
+      }
+      return originalLstatSync(targetPath, options);
+    };
+    syncBuiltinESMExports();
+
+    let healthCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(ownerRemoved, true);
+    assert.equal(emptyIdentity.dev, originalIdentity.dev);
+    assert.equal(emptyIdentity.ino, originalIdentity.ino);
+    assert.equal(spawnCalls, 1);
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(existsSync(publicClaimPath), false);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('persistent empty-claim contention exhausts the existing bounded acquisition budget', async () => {
+  const fixture = createManagedFixture('gl-c4-empty-claim-bounded-');
+  const publicClaimPath = launchClaimPath(fixture.layout);
+  const originalReaddirSync = fs.readdirSync;
+  const originalRenameSync = fs.renameSync;
+  let claimReads = 0;
+  let publicationConflicts = 0;
+  let spawnCalled = false;
+
+  try {
+    mkdirSync(publicClaimPath, { mode: 0o700 });
+    fs.readdirSync = (targetPath, options) => {
+      const entries = originalReaddirSync(targetPath, options);
+      if (targetPath === publicClaimPath) {
+        claimReads += 1;
+        assert.deepEqual(entries, []);
+      }
+      return entries;
+    };
+    fs.renameSync = (sourcePath, destinationPath) => {
+      if (
+        sourcePath.startsWith(`${publicClaimPath}.tmp-${process.pid}-`) &&
+        destinationPath === publicClaimPath
+      ) {
+        publicationConflicts += 1;
+        const error = new Error('synthetic persistent empty-claim contention');
+        error.code = 'ENOTEMPTY';
+        throw error;
+      }
+      return originalRenameSync(sourcePath, destinationPath);
+    };
+    syncBuiltinESMExports();
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+        spawnImpl: () => {
+          spawnCalled = true;
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_IN_PROGRESS',
+    );
+
+    assert.equal(publicationConflicts, 33);
+    assert.equal(claimReads, 32);
+    assert.equal(spawnCalled, false);
+    assert.deepEqual(readdirSync(publicClaimPath), []);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+    fs.renameSync = originalRenameSync;
+    syncBuiltinESMExports();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('stable nonempty malformed claim layouts remain fail-closed', async () => {
+  const cases = [
+    {
+      prefix: 'gl-c4-invalid-claim-extra-entry-',
+      setup(publicClaimPath) {
+        writeLaunchClaimDirectory(publicClaimPath);
+        writeFileSync(path.join(publicClaimPath, 'extra.json'), '{}\n');
+      },
+    },
+    {
+      prefix: 'gl-c4-invalid-claim-entry-name-',
+      setup(publicClaimPath) {
+        mkdirSync(publicClaimPath, { mode: 0o700 });
+        writeFileSync(path.join(publicClaimPath, 'not-an-owner.json'), '{}\n');
+      },
+    },
+  ];
+
+  for (const fixtureCase of cases) {
+    const fixture = createManagedFixture(fixtureCase.prefix);
+    const publicClaimPath = launchClaimPath(fixture.layout);
+    let spawnCalled = false;
+    try {
+      fixtureCase.setup(publicClaimPath);
+      await assert.rejects(
+        () => ensureBackendReady({
+          config: fixture.currentConfig,
+          env: { HOME: fixture.home },
+          fetchImpl: async () => unhealthyResponse(),
+          spawnImpl: () => {
+            spawnCalled = true;
+            throw new Error('must not spawn');
+          },
+        }),
+        (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_LAUNCH_CLAIM_INVALID',
+      );
+      assert.equal(spawnCalled, false);
+      assert.equal(existsSync(publicClaimPath), true);
+    } finally {
+      rmSync(fixture.home, { recursive: true, force: true });
+    }
+  }
+});
+
 test('repeated stable stale-claim handoffs stop at the bounded acquisition retry limit', async () => {
   const fixture = createManagedFixture('gl-c4-claim-read-bounded-retries-');
   const publicClaimPath = launchClaimPath(fixture.layout);

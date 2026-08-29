@@ -444,6 +444,15 @@ function retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange) {
   }
 }
 
+function retryIfLaunchClaimDirectoryBecameEmpty(claimPath, retryOnChange) {
+  if (!retryOnChange) return;
+  try {
+    if (readdirSync(claimPath).length === 0) throw new LaunchClaimReadRetryError();
+  } catch (error) {
+    if (error instanceof LaunchClaimReadRetryError) throw error;
+  }
+}
+
 function readLaunchClaimPath(claimPath, { absentOk = false, retryOnChange = false } = {}) {
   let before;
   try {
@@ -464,6 +473,7 @@ function readLaunchClaimPath(claimPath, { absentOk = false, retryOnChange = fals
     retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'unable to read the managed launch claim');
   }
+  if (retryOnChange && entries.length === 0) throw new LaunchClaimReadRetryError();
   if (entries.length !== 1 || !/^owner-[0-9a-f-]+\.json$/.test(entries[0])) {
     retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim directory is malformed');
@@ -472,6 +482,7 @@ function readLaunchClaimPath(claimPath, { absentOk = false, retryOnChange = fals
   try {
     text = readRegularFileNoFollow(path.join(claimPath, entries[0]), MAX_MANAGED_FILE_BYTES);
   } catch (error) {
+    retryIfLaunchClaimDirectoryBecameEmpty(claimPath, retryOnChange);
     retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     throw error;
   }
@@ -486,6 +497,7 @@ function readLaunchClaimPath(claimPath, { absentOk = false, retryOnChange = fals
     retryIfLaunchClaimIdentityChanged(claimPath, before, retryOnChange);
     fail('MANAGED_LAUNCH_CLAIM_INVALID', 'managed launch claim token does not match its owner record');
   }
+  retryIfLaunchClaimDirectoryBecameEmpty(claimPath, retryOnChange);
 
   let after;
   try {
