@@ -181,6 +181,79 @@ function mockDefaultSpawn(spawnImpl) {
   });
 }
 
+function mockVerifiedManagedProcess({ pid, serverPath, modelPath, backendModel, startTicks = '111' }) {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const originalKill = process.kill;
+  const originalReadFileSync = fs.readFileSync;
+  const originalRealpathSync = fs.realpathSync;
+  const signals = [];
+  let alive = true;
+  let currentStartTicks = startTicks;
+
+  Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'linux' });
+  process.kill = (targetPid, signal) => {
+    if (targetPid !== pid) return originalKill(targetPid, signal);
+    if (signal === 0) {
+      if (alive) return true;
+      const error = new Error('ESRCH: no such process');
+      error.code = 'ESRCH';
+      throw error;
+    }
+    signals.push(signal);
+    alive = false;
+    return true;
+  };
+  fs.realpathSync = (targetPath, ...args) => {
+    if (targetPath === `/proc/${pid}/exe`) {
+      if (alive) return serverPath;
+      const error = new Error('ENOENT: no such file or directory');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return originalRealpathSync(targetPath, ...args);
+  };
+  fs.readFileSync = (targetPath, ...args) => {
+    if (targetPath === `/proc/${pid}/stat`) {
+      if (!alive) {
+        const error = new Error('ENOENT: no such file or directory');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return `${pid} (llama-server) S ${Array(18).fill('0').join(' ')} ${currentStartTicks}\n`;
+    }
+    if (targetPath === `/proc/${pid}/cmdline`) {
+      if (!alive) {
+        const error = new Error('ENOENT: no such file or directory');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return Buffer.from(
+        [serverPath, '-m', modelPath, '--host', '127.0.0.1', '-a', backendModel, ''].join('\0'),
+      );
+    }
+    return originalReadFileSync(targetPath, ...args);
+  };
+  syncBuiltinESMExports();
+
+  return Object.freeze({
+    signals,
+    get alive() {
+      return alive;
+    },
+    revive(nextStartTicks) {
+      currentStartTicks = nextStartTicks;
+      alive = true;
+    },
+    restore() {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      process.kill = originalKill;
+      fs.readFileSync = originalReadFileSync;
+      fs.realpathSync = originalRealpathSync;
+      syncBuiltinESMExports();
+    },
+  });
+}
+
 async function exitedChildPid() {
   const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
   const spawned = once(child, 'spawn');
@@ -3205,6 +3278,324 @@ test('stop clears recycled-PID state without signaling the unrelated live proces
     assert.deepEqual(capturedSignals.signals, []);
     assert.equal(existsSync(fixture.layout.backendStatePath), false);
   } finally {
+    capturedSignals.restore();
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('restart preflights a missing launch config before signaling a verified live backend', async () => {
+  const fixture = createManagedFixture('gl-c4-restart-preflight-missing-');
+  rmSync(fixture.layout.backendLaunchConfigPath);
+  writeCurrentState(fixture.layout, {
+    pid: process.pid,
+    procStartTicks: '111',
+    currentConfig: fixture.currentConfig,
+    serverPath: fixture.serverPath,
+    serverContent: fixture.serverContent,
+    modelPath: fixture.modelPath,
+    modelContent: fixture.modelContent,
+    launchArgvSha256: argvSha256(fixture.currentArgs),
+  });
+  const stateBefore = readFileSync(fixture.layout.backendStatePath, 'utf8');
+  const managedProcess = mockVerifiedManagedProcess({
+    pid: process.pid,
+    serverPath: fixture.serverPath,
+    modelPath: fixture.modelPath,
+    backendModel: fixture.currentConfig.backendModel,
+  });
+  try {
+    let fetchCalls = 0;
+    let restartError = null;
+    try {
+      await restartManagedBackend({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => {
+          fetchCalls += 1;
+          return unhealthyResponse();
+        },
+      });
+    } catch (error) {
+      restartError = error;
+    }
+
+    assert.deepEqual(managedProcess.signals, []);
+    assert.equal(managedProcess.alive, true);
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), stateBefore);
+    assert.equal(fetchCalls, 0);
+    assert.equal(restartError instanceof ManagedBackendError, true);
+    assert.equal(restartError.category, 'MANAGED_CONFIG_INVALID');
+    assert.match(String(restartError.message), /restore|configure/i);
+  } finally {
+    managedProcess.restore();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('restart preflights malformed paths and artifact hashes before signaling', async (t) => {
+  const cases = [
+    {
+      name: 'malformed JSON',
+      category: 'MANAGED_CONFIG_INVALID',
+      writeConfig(fixture) {
+        writeFileSync(fixture.layout.backendLaunchConfigPath, '{"schemaVersion":');
+      },
+    },
+    {
+      name: 'missing server path',
+      category: 'MANAGED_CONFIG_INVALID',
+      writeConfig(fixture) {
+        writeFileSync(fixture.layout.backendLaunchConfigPath, `${JSON.stringify({
+          schemaVersion: 1,
+          serverPath: path.join(fixture.home, 'missing-server'),
+          serverSha256: sha256(fixture.serverContent),
+          modelPath: fixture.modelPath,
+          modelSha256: sha256(fixture.modelContent),
+        })}\n`);
+      },
+    },
+    {
+      name: 'missing model path',
+      category: 'MANAGED_CONFIG_INVALID',
+      writeConfig(fixture) {
+        writeFileSync(fixture.layout.backendLaunchConfigPath, `${JSON.stringify({
+          schemaVersion: 1,
+          serverPath: fixture.serverPath,
+          serverSha256: sha256(fixture.serverContent),
+          modelPath: path.join(fixture.home, 'missing-model.gguf'),
+          modelSha256: sha256(fixture.modelContent),
+        })}\n`);
+      },
+    },
+    {
+      name: 'server hash mismatch',
+      category: 'MANAGED_ARTIFACT_MISMATCH',
+      writeConfig(fixture) {
+        writeFileSync(fixture.layout.backendLaunchConfigPath, `${JSON.stringify({
+          schemaVersion: 1,
+          serverPath: fixture.serverPath,
+          serverSha256: '0'.repeat(64),
+          modelPath: fixture.modelPath,
+          modelSha256: sha256(fixture.modelContent),
+        })}\n`);
+      },
+    },
+    {
+      name: 'model hash mismatch',
+      category: 'MANAGED_ARTIFACT_MISMATCH',
+      writeConfig(fixture) {
+        writeFileSync(fixture.layout.backendLaunchConfigPath, `${JSON.stringify({
+          schemaVersion: 1,
+          serverPath: fixture.serverPath,
+          serverSha256: sha256(fixture.serverContent),
+          modelPath: fixture.modelPath,
+          modelSha256: '0'.repeat(64),
+        })}\n`);
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async () => {
+      const fixture = createManagedFixture(`gl-c4-restart-preflight-${testCase.name.replaceAll(' ', '-')}-`);
+      testCase.writeConfig(fixture);
+      writeCurrentState(fixture.layout, {
+        pid: process.pid,
+        procStartTicks: '111',
+        currentConfig: fixture.currentConfig,
+        serverPath: fixture.serverPath,
+        serverContent: fixture.serverContent,
+        modelPath: fixture.modelPath,
+        modelContent: fixture.modelContent,
+        launchArgvSha256: argvSha256(fixture.currentArgs),
+      });
+      const stateBefore = readFileSync(fixture.layout.backendStatePath, 'utf8');
+      const managedProcess = mockVerifiedManagedProcess({
+        pid: process.pid,
+        serverPath: fixture.serverPath,
+        modelPath: fixture.modelPath,
+        backendModel: fixture.currentConfig.backendModel,
+      });
+      try {
+        let fetchCalls = 0;
+        let restartError = null;
+        try {
+          await restartManagedBackend({
+            config: fixture.currentConfig,
+            env: { HOME: fixture.home },
+            fetchImpl: async () => {
+              fetchCalls += 1;
+              return unhealthyResponse();
+            },
+          });
+        } catch (error) {
+          restartError = error;
+        }
+
+        assert.deepEqual(managedProcess.signals, []);
+        assert.equal(managedProcess.alive, true);
+        assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), stateBefore);
+        assert.equal(fetchCalls, 0);
+        assert.equal(restartError instanceof ManagedBackendError, true);
+        assert.equal(restartError.category, testCase.category);
+        assert.match(String(restartError.message), /restore|configure/i);
+      } finally {
+        managedProcess.restore();
+        rmSync(fixture.home, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('restart with a valid full launch config stops one verified process and starts one replacement', async () => {
+  const fixture = createManagedFixture('gl-c4-restart-preflight-valid-');
+  writeCurrentState(fixture.layout, {
+    pid: process.pid,
+    procStartTicks: '111',
+    currentConfig: fixture.currentConfig,
+    serverPath: fixture.serverPath,
+    serverContent: fixture.serverContent,
+    modelPath: fixture.modelPath,
+    modelContent: fixture.modelContent,
+    launchArgvSha256: argvSha256(fixture.currentArgs),
+  });
+  const managedProcess = mockVerifiedManagedProcess({
+    pid: process.pid,
+    serverPath: fixture.serverPath,
+    modelPath: fixture.modelPath,
+    backendModel: fixture.currentConfig.backendModel,
+  });
+  const mockedSpawn = mockDefaultSpawn(() => {
+    managedProcess.revive('222');
+    return fakeSpawnedChild();
+  });
+  try {
+    let healthCalls = 0;
+    const result = await restartManagedBackend({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+    });
+
+    assert.equal(result.mode, 'managed-started');
+    assert.deepEqual(managedProcess.signals, ['SIGTERM']);
+    assert.equal(mockedSpawn.calls, 1);
+    const state = JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8'));
+    assert.equal(state.pid, process.pid);
+    assert.equal(state.procStartTicks, '222');
+    assert.equal(state.serverPath, fixture.serverPath);
+    assert.equal(state.modelPath, fixture.modelPath);
+  } finally {
+    mockedSpawn.restore();
+    managedProcess.restore();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('restart re-verifies managed ownership after full launch preflight before signaling', async () => {
+  const fixture = createManagedFixture('gl-c4-restart-preflight-identity-change-');
+  writeCurrentState(fixture.layout, {
+    pid: process.pid,
+    procStartTicks: '111',
+    currentConfig: fixture.currentConfig,
+    serverPath: fixture.serverPath,
+    serverContent: fixture.serverContent,
+    modelPath: fixture.modelPath,
+    modelContent: fixture.modelContent,
+    launchArgvSha256: argvSha256(fixture.currentArgs),
+  });
+  const stateBefore = readFileSync(fixture.layout.backendStatePath, 'utf8');
+  const managedProcess = mockVerifiedManagedProcess({
+    pid: process.pid,
+    serverPath: fixture.serverPath,
+    modelPath: fixture.modelPath,
+    backendModel: fixture.currentConfig.backendModel,
+  });
+  const originalOpenSync = fs.openSync;
+  const originalReadSync = fs.readSync;
+  let modelFd = null;
+  let identityChanged = false;
+  fs.openSync = (targetPath, ...args) => {
+    const fd = originalOpenSync(targetPath, ...args);
+    if (targetPath === fixture.modelPath) modelFd = fd;
+    return fd;
+  };
+  fs.readSync = (fd, ...args) => {
+    const count = originalReadSync(fd, ...args);
+    if (!identityChanged && fd === modelFd && count > 0) {
+      identityChanged = true;
+      managedProcess.revive('222');
+    }
+    return count;
+  };
+  syncBuiltinESMExports();
+
+  try {
+    let fetchCalls = 0;
+    let restartError = null;
+    try {
+      await restartManagedBackend({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => {
+          fetchCalls += 1;
+          return unhealthyResponse();
+        },
+      });
+    } catch (error) {
+      restartError = error;
+    }
+
+    assert.equal(identityChanged, true);
+    assert.deepEqual(managedProcess.signals, []);
+    assert.equal(managedProcess.alive, true);
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), stateBefore);
+    assert.equal(fetchCalls, 0);
+    assert.equal(restartError instanceof ManagedBackendError, true);
+    assert.equal(restartError.category, 'BACKEND_OWNERSHIP_UNVERIFIED');
+    assert.match(String(restartError.message), /identity changed.*refusing SIGTERM/i);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.readSync = originalReadSync;
+    syncBuiltinESMExports();
+    managedProcess.restore();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('recycled-state restart cleanup is not blocked by a missing launch config', async () => {
+  const fixture = createManagedFixture('gl-c4-restart-recycled-missing-config-');
+  rmSync(fixture.layout.backendLaunchConfigPath);
+  writeCurrentState(fixture.layout, {
+    pid: process.pid,
+    procStartTicks: '111',
+    currentConfig: fixture.currentConfig,
+    serverPath: fixture.serverPath,
+    serverContent: fixture.serverContent,
+    modelPath: fixture.modelPath,
+    modelContent: fixture.modelContent,
+    launchArgvSha256: argvSha256(fixture.currentArgs),
+  });
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  const capturedSignals = captureSignalsForPid(process.pid);
+  const mockedSpawn = mockDefaultSpawn(() => fakeSpawnedChild());
+  try {
+    const result = await restartManagedBackend({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => healthyResponse(),
+    });
+
+    assert.deepEqual(result, { ready: true, started: false, mode: 'reused-healthy' });
+    assert.deepEqual(capturedSignals.signals, []);
+    assert.equal(mockedSpawn.calls, 0);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+  } finally {
+    mockedSpawn.restore();
     capturedSignals.restore();
     restoreProc();
     rmSync(fixture.home, { recursive: true, force: true });

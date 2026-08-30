@@ -966,7 +966,7 @@ function killOwnedProcessBestEffort(pid) {
   }
 }
 
-async function stopRecordedManagedBackend(state, env) {
+async function stopRecordedManagedBackend(state, env, beforeSignal = null) {
   let currentState = state;
   let replacedDuringStaleCleanup = false;
   while (recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(currentState))) {
@@ -983,6 +983,15 @@ async function stopRecordedManagedBackend(state, env) {
   }
   if (!verifyOwnedProcess(currentState)) {
     fail('BACKEND_OWNERSHIP_UNVERIFIED', 'refusing to signal a process whose managed ownership cannot be verified');
+  }
+  if (beforeSignal) {
+    beforeSignal();
+    if (!verifyOwnedProcess(currentState)) {
+      fail(
+        'BACKEND_OWNERSHIP_UNVERIFIED',
+        'managed process identity changed during restart preflight; refusing SIGTERM',
+      );
+    }
   }
 
   process.kill(currentState.pid, 'SIGTERM');
@@ -1016,7 +1025,7 @@ function reuseHealthyBackend(config, env, knownLaunchIdentity = null, ownedLaunc
   if (!launchIdentity) {
     fail(
       'MANAGED_STATE_CONFLICT',
-      'a healthy managed backend is recorded but the managed launch config is missing; use gemini-local restart',
+      'a healthy managed backend is recorded but the managed launch config is missing; restore or configure it before using gemini-local restart',
     );
   }
   const endpoint = parseManagedEndpoint(config.backendOrigin);
@@ -1232,7 +1241,7 @@ export async function getBackendStatus({ config, env = process.env, fetchImpl = 
       healthy,
       managed: true,
       pid: state.pid,
-      detail: 'current managed launch config is invalid; use gemini-local restart',
+      detail: 'current managed launch config is invalid; restore or configure it before using gemini-local restart',
     });
   }
   if (!launchIdentity) {
@@ -1241,7 +1250,7 @@ export async function getBackendStatus({ config, env = process.env, fetchImpl = 
       healthy,
       managed: true,
       pid: state.pid,
-      detail: 'current managed launch config is missing; use gemini-local restart',
+      detail: 'current managed launch config is missing; restore or configure it before using gemini-local restart',
     });
   }
 
@@ -1279,8 +1288,40 @@ export async function stopManagedBackend({ config, env = process.env } = {}) {
   return stopRecordedManagedBackend(state, env);
 }
 
+function preflightManagedRestart(config, env) {
+  if (!isPlainObject(config)) {
+    fail('MANAGED_CONFIG_INVALID', 'validated local config is required before restarting a managed backend');
+  }
+  validateBackendOrigin(config.backendOrigin);
+
+  let launch;
+  try {
+    launch = loadManagedLaunchConfig(env);
+  } catch (error) {
+    if (error instanceof ManagedBackendError) {
+      fail(
+        error.category,
+        `managed launch configuration is not usable; restore or configure it before retrying restart: ${error.message}`,
+      );
+    }
+    fail(
+      'MANAGED_CONFIG_INVALID',
+      'managed launch configuration could not be verified; restore or configure it before retrying restart',
+    );
+  }
+  if (!launch) {
+    fail(
+      'MANAGED_CONFIG_INVALID',
+      'managed launch configuration is missing; restore or configure it before retrying restart',
+    );
+  }
+
+  const endpoint = parseManagedEndpoint(config.backendOrigin);
+  buildManagedLlamaServerArgs(launch, config, endpoint);
+}
+
 export async function restartManagedBackend({ config, env = process.env, fetchImpl = fetch } = {}) {
   const state = readState(env);
-  if (state) await stopRecordedManagedBackend(state, env);
+  if (state) await stopRecordedManagedBackend(state, env, () => preflightManagedRestart(config, env));
   return ensureBackendReady({ config, env, fetchImpl });
 }
