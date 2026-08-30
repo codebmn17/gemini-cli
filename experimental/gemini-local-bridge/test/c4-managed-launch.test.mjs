@@ -4,7 +4,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import childProcess, { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import fs from 'node:fs';
@@ -22,6 +22,7 @@ import {
   MANAGED_LAUNCH_CLAIM_STALE_MS,
   ManagedBackendError,
   restartManagedBackend,
+  stopManagedBackend,
 } from '../lib/managed-backend.mjs';
 import { resolveLayout } from '../lib/paths.mjs';
 
@@ -92,14 +93,23 @@ function writeLaunchConfig(layout, { serverPath, serverContent, modelPath, model
 
 function writeCurrentState(
   layout,
-  { pid, currentConfig, serverPath, serverContent, modelPath, modelContent, launchArgvSha256 },
+  {
+    pid,
+    procStartTicks = null,
+    currentConfig,
+    serverPath,
+    serverContent,
+    modelPath,
+    modelContent,
+    launchArgvSha256,
+  },
 ) {
   writeFileSync(
     layout.backendStatePath,
     JSON.stringify({
       schemaVersion: 1,
       pid,
-      procStartTicks: null,
+      procStartTicks,
       backendOrigin: currentConfig.backendOrigin,
       backendModel: currentConfig.backendModel,
       serverPath,
@@ -110,6 +120,65 @@ function writeCurrentState(
       launchArgvSha256,
     }) + '\n',
   );
+}
+
+function mockProcStartTicks(pid, currentTicks) {
+  const originalReadFileSync = fs.readFileSync;
+  const procStatPath = `/proc/${pid}/stat`;
+  fs.readFileSync = (targetPath, ...args) => {
+    if (targetPath === procStatPath) {
+      const observedTicks = typeof currentTicks === 'function' ? currentTicks() : currentTicks;
+      if (observedTicks === null) {
+        const error = new Error(`ENOENT: no such file or directory, open '${procStatPath}'`);
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return `${pid} (node) S ${Array(18).fill('0').join(' ')} ${observedTicks}\n`;
+    }
+    return originalReadFileSync(targetPath, ...args);
+  };
+  syncBuiltinESMExports();
+  return () => {
+    fs.readFileSync = originalReadFileSync;
+    syncBuiltinESMExports();
+  };
+}
+
+function captureSignalsForPid(pid) {
+  const originalKill = process.kill;
+  const signals = [];
+  process.kill = (targetPid, signal) => {
+    if (targetPid === pid && signal !== 0) {
+      signals.push(signal);
+      return true;
+    }
+    return originalKill(targetPid, signal);
+  };
+  return Object.freeze({
+    signals,
+    restore() {
+      process.kill = originalKill;
+    },
+  });
+}
+
+function mockDefaultSpawn(spawnImpl) {
+  const originalSpawn = childProcess.spawn;
+  let calls = 0;
+  childProcess.spawn = (...args) => {
+    calls += 1;
+    return spawnImpl(...args);
+  };
+  syncBuiltinESMExports();
+  return Object.freeze({
+    get calls() {
+      return calls;
+    },
+    restore() {
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+    },
+  });
 }
 
 async function exitedChildPid() {
@@ -531,6 +600,111 @@ test('healthy backend removes dead managed state before requiring a missing laun
   }
 });
 
+test('healthy backend clears a recycled-PID state before requiring launch identity', async () => {
+  const fixture = createManagedFixture('gl-c4-recycled-healthy-');
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  try {
+    rmSync(fixture.layout.backendLaunchConfigPath);
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '111',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    let spawnCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => healthyResponse(),
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+    });
+
+    assert.deepEqual(result, { ready: true, started: false, mode: 'reused-healthy' });
+    assert.equal(spawnCalls, 0);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+  } finally {
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('recycled-state cleanup re-reads and preserves a concurrently published live successor', async () => {
+  const fixture = createManagedFixture('gl-c4-recycled-successor-');
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  const originalRenameSync = fs.renameSync;
+  let successorText = null;
+  let replacementPublished = false;
+  try {
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '111',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    fs.renameSync = (sourcePath, destinationPath) => {
+      originalRenameSync(sourcePath, destinationPath);
+      if (
+        !replacementPublished &&
+        sourcePath === fixture.layout.backendStatePath &&
+        destinationPath.startsWith(`${fixture.layout.backendStatePath}.stale-`)
+      ) {
+        replacementPublished = true;
+        writeCurrentState(fixture.layout, {
+          pid: process.pid,
+          procStartTicks: '222',
+          currentConfig: fixture.currentConfig,
+          serverPath: fixture.serverPath,
+          serverContent: fixture.serverContent,
+          modelPath: fixture.modelPath,
+          modelContent: fixture.modelContent,
+          launchArgvSha256: argvSha256(fixture.currentArgs),
+        });
+        successorText = readFileSync(fixture.layout.backendStatePath, 'utf8');
+      }
+    };
+    syncBuiltinESMExports();
+
+    let spawnCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => healthyResponse(),
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+    });
+
+    assert.equal(replacementPublished, true);
+    assert.deepEqual(result, {
+      ready: true,
+      started: false,
+      mode: 'reused-healthy',
+      pid: process.pid,
+    });
+    assert.equal(spawnCalls, 0);
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), successorText);
+  } finally {
+    fs.renameSync = originalRenameSync;
+    syncBuiltinESMExports();
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
 test('healthy backend removes dead managed state before comparing a changed launch identity', async () => {
   const home = tempHome('gl-c4-dead-state-changed-launch-');
   try {
@@ -697,6 +871,96 @@ test('healthy backend with live managed state still rejects a missing launch ide
   }
 });
 
+test('matching recorded and current start ticks preserve live-state launch validation', async () => {
+  const fixture = createManagedFixture('gl-c4-matching-start-ticks-');
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  try {
+    rmSync(fixture.layout.backendLaunchConfigPath);
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '222',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+    const stateBefore = readFileSync(fixture.layout.backendStatePath, 'utf8');
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => healthyResponse(),
+        spawnImpl: () => {
+          throw new Error('must not spawn');
+        },
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_STATE_CONFLICT',
+    );
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), stateBefore);
+  } finally {
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('unavailable current start ticks remain unknown and fail closed without deletion or signaling', async () => {
+  const fixture = createManagedFixture('gl-c4-unknown-start-ticks-');
+  const restoreProc = mockProcStartTicks(process.pid, null);
+  const capturedSignals = captureSignalsForPid(process.pid);
+  try {
+    rmSync(fixture.layout.backendLaunchConfigPath);
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '111',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+    const stateBefore = readFileSync(fixture.layout.backendStatePath, 'utf8');
+
+    const status = await getBackendStatus({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => healthyResponse(),
+    });
+    assert.equal(status.status, 'state-conflict');
+
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => healthyResponse(),
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'MANAGED_STATE_CONFLICT',
+    );
+    await assert.rejects(
+      () => stopManagedBackend({ config: fixture.currentConfig, env: { HOME: fixture.home } }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_OWNERSHIP_UNVERIFIED',
+    );
+    await assert.rejects(
+      () => restartManagedBackend({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => unhealthyResponse(),
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_OWNERSHIP_UNVERIFIED',
+    );
+
+    assert.deepEqual(capturedSignals.signals, []);
+    assert.equal(readFileSync(fixture.layout.backendStatePath, 'utf8'), stateBefore);
+  } finally {
+    capturedSignals.restore();
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
 test('unhealthy path re-reads managed state written during the health check before spawning', async () => {
   const home = tempHome('gl-c4-unhealthy-state-created-');
   try {
@@ -804,6 +1068,49 @@ test('unhealthy path does not delete live managed state that replaces a dead sna
     assert.equal(JSON.parse(readFileSync(layout.backendStatePath, 'utf8')).pid, process.pid);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('unhealthy managed start clears recycled-PID state and publishes one new owner', async () => {
+  const fixture = createManagedFixture('gl-c4-recycled-unhealthy-');
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  try {
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '111',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    let healthCalls = 0;
+    let spawnCalls = 0;
+    const result = await ensureBackendReady({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+      spawnImpl: () => {
+        spawnCalls += 1;
+        return fakeSpawnedChild();
+      },
+      startupTimeoutMs: 5_000,
+    });
+
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(spawnCalls, 1);
+    const state = JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8'));
+    assert.equal(state.pid, process.pid);
+    assert.equal(state.procStartTicks, '222');
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+  } finally {
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
   }
 });
 
@@ -2559,6 +2866,44 @@ test('startup timeout leaves neither the published state nor a stale launch clai
   }
 });
 
+test('startup does not report success after the published child PID is recycled during health', async () => {
+  const fixture = createManagedFixture('gl-c4-startup-pid-recycled-');
+  let currentTicks = '111';
+  const restoreProc = mockProcStartTicks(process.pid, () => currentTicks);
+  const capturedSignals = captureSignalsForPid(process.pid);
+  try {
+    let healthCalls = 0;
+    let spawnCalls = 0;
+    await assert.rejects(
+      () => ensureBackendReady({
+        config: fixture.currentConfig,
+        env: { HOME: fixture.home },
+        fetchImpl: async () => {
+          healthCalls += 1;
+          if (healthCalls <= 2) return unhealthyResponse();
+          currentTicks = '222';
+          return healthyResponse();
+        },
+        spawnImpl: () => {
+          spawnCalls += 1;
+          return fakeSpawnedChild();
+        },
+        startupTimeoutMs: 5_000,
+      }),
+      (error) => error instanceof ManagedBackendError && error.category === 'BACKEND_START_FAILED',
+    );
+
+    assert.equal(spawnCalls, 1);
+    assert.deepEqual(capturedSignals.signals, []);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+    assert.equal(existsSync(launchClaimPath(fixture.layout)), false);
+  } finally {
+    capturedSignals.restore();
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
 test('healthy managed backend with matching current policy reuses the recorded PID without spawning', async () => {
   const home = tempHome('gl-c4-current-policy-');
   try {
@@ -2657,6 +3002,42 @@ test('healthy managed backend with matching identity rejects an incorrect launch
     assert.equal(spawnCalled, false);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('status reports recycled-PID state as stale before launch-policy validation', async () => {
+  const fixture = createManagedFixture('gl-c4-status-recycled-');
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  try {
+    rmSync(fixture.layout.backendLaunchConfigPath);
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '111',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    const result = await getBackendStatus({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => healthyResponse(),
+    });
+
+    assert.deepEqual(result, {
+      status: 'stale-state',
+      healthy: true,
+      managed: true,
+      pid: process.pid,
+      ownedProcessVerified: false,
+    });
+    assert.equal(existsSync(fixture.layout.backendStatePath), true);
+  } finally {
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
   }
 });
 
@@ -2796,6 +3177,78 @@ test('status reports stale state before requiring a missing launch identity', as
     assert.equal(existsSync(layout.backendStatePath), true);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('stop clears recycled-PID state without signaling the unrelated live process', async () => {
+  const fixture = createManagedFixture('gl-c4-stop-recycled-');
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  const capturedSignals = captureSignalsForPid(process.pid);
+  try {
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '111',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    const result = await stopManagedBackend({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+    });
+
+    assert.deepEqual(result, { stopped: false, status: 'stale-state-removed' });
+    assert.deepEqual(capturedSignals.signals, []);
+    assert.equal(existsSync(fixture.layout.backendStatePath), false);
+  } finally {
+    capturedSignals.restore();
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
+  }
+});
+
+test('restart clears recycled-PID state without signaling and starts one new managed child', async () => {
+  const fixture = createManagedFixture('gl-c4-restart-recycled-');
+  const restoreProc = mockProcStartTicks(process.pid, '222');
+  const capturedSignals = captureSignalsForPid(process.pid);
+  const mockedSpawn = mockDefaultSpawn(() => fakeSpawnedChild());
+  try {
+    writeCurrentState(fixture.layout, {
+      pid: process.pid,
+      procStartTicks: '111',
+      currentConfig: fixture.currentConfig,
+      serverPath: fixture.serverPath,
+      serverContent: fixture.serverContent,
+      modelPath: fixture.modelPath,
+      modelContent: fixture.modelContent,
+      launchArgvSha256: argvSha256(fixture.currentArgs),
+    });
+
+    let healthCalls = 0;
+    const result = await restartManagedBackend({
+      config: fixture.currentConfig,
+      env: { HOME: fixture.home },
+      fetchImpl: async () => {
+        healthCalls += 1;
+        return healthCalls <= 2 ? unhealthyResponse() : healthyResponse();
+      },
+    });
+
+    assert.equal(result.mode, 'managed-started');
+    assert.equal(mockedSpawn.calls, 1);
+    assert.deepEqual(capturedSignals.signals, []);
+    const state = JSON.parse(readFileSync(fixture.layout.backendStatePath, 'utf8'));
+    assert.equal(state.pid, process.pid);
+    assert.equal(state.procStartTicks, '222');
+  } finally {
+    mockedSpawn.restore();
+    capturedSignals.restore();
+    restoreProc();
+    rmSync(fixture.home, { recursive: true, force: true });
   }
 });
 

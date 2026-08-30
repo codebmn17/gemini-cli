@@ -356,6 +356,34 @@ function readProcStartTicks(pid) {
   }
 }
 
+const RECORDED_PROCESS_IDENTITY = Object.freeze({
+  STALE_DEAD: 'stale-dead',
+  STALE_RECYCLED: 'stale-recycled',
+  LIVE_SAME: 'live-same',
+  UNKNOWN: 'unknown',
+});
+
+function classifyRecordedProcessIdentity(state) {
+  if (!state || !isProcessAlive(state.pid)) return RECORDED_PROCESS_IDENTITY.STALE_DEAD;
+  if (typeof state.procStartTicks !== 'string' || !/^\d+$/.test(state.procStartTicks)) {
+    return RECORDED_PROCESS_IDENTITY.UNKNOWN;
+  }
+  const currentStartTicks = readProcStartTicks(state.pid);
+  if (typeof currentStartTicks !== 'string' || !/^\d+$/.test(currentStartTicks)) {
+    return RECORDED_PROCESS_IDENTITY.UNKNOWN;
+  }
+  return currentStartTicks === state.procStartTicks
+    ? RECORDED_PROCESS_IDENTITY.LIVE_SAME
+    : RECORDED_PROCESS_IDENTITY.STALE_RECYCLED;
+}
+
+function recordedProcessIdentityIsStale(identity) {
+  return (
+    identity === RECORDED_PROCESS_IDENTITY.STALE_DEAD ||
+    identity === RECORDED_PROCESS_IDENTITY.STALE_RECYCLED
+  );
+}
+
 function launchArgvSha256(args) {
   return createHash('sha256').update(JSON.stringify(args)).digest('hex');
 }
@@ -921,13 +949,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForProcessExit(pid, timeoutMs) {
+async function waitForRecordedProcessExit(state, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return true;
+    if (recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(state))) return true;
     await sleep(100);
   }
-  return !isProcessAlive(pid);
+  return recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(state));
 }
 
 function killOwnedProcessBestEffort(pid) {
@@ -939,34 +967,45 @@ function killOwnedProcessBestEffort(pid) {
 }
 
 async function stopRecordedManagedBackend(state, env) {
-  if (!isProcessAlive(state.pid)) {
-    removeStateIfMatches(env, state);
-    return Object.freeze({ stopped: false, status: 'stale-state-removed' });
+  let currentState = state;
+  let replacedDuringStaleCleanup = false;
+  while (recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(currentState))) {
+    removeStateIfMatches(env, currentState);
+    const replacement = readState(env);
+    if (!replacement) {
+      return Object.freeze({ stopped: false, status: 'stale-state-removed' });
+    }
+    replacedDuringStaleCleanup = replacedDuringStaleCleanup || !statesEqual(replacement, currentState);
+    currentState = replacement;
   }
-  if (!verifyOwnedProcess(state)) {
+  if (replacedDuringStaleCleanup) {
+    fail('MANAGED_STATE_CONFLICT', 'managed backend state changed during stale cleanup; retry the operation');
+  }
+  if (!verifyOwnedProcess(currentState)) {
     fail('BACKEND_OWNERSHIP_UNVERIFIED', 'refusing to signal a process whose managed ownership cannot be verified');
   }
 
-  process.kill(state.pid, 'SIGTERM');
-  if (!(await waitForProcessExit(state.pid, BACKEND_STOP_GRACE_MS))) {
-    if (!verifyOwnedProcess(state)) {
+  process.kill(currentState.pid, 'SIGTERM');
+  if (!(await waitForRecordedProcessExit(currentState, BACKEND_STOP_GRACE_MS))) {
+    if (!verifyOwnedProcess(currentState)) {
       fail('BACKEND_OWNERSHIP_UNVERIFIED', 'process identity changed while stopping; refusing SIGKILL');
     }
-    process.kill(state.pid, 'SIGKILL');
-    if (!(await waitForProcessExit(state.pid, BACKEND_KILL_GRACE_MS))) {
+    process.kill(currentState.pid, 'SIGKILL');
+    if (!(await waitForRecordedProcessExit(currentState, BACKEND_KILL_GRACE_MS))) {
       fail('BACKEND_STOP_FAILED', 'managed llama-server did not terminate after SIGKILL');
     }
   }
-  removeStateIfMatches(env, state);
+  removeStateIfMatches(env, currentState);
   return Object.freeze({ stopped: true, status: 'stopped' });
 }
 
 function reuseHealthyBackend(config, env, knownLaunchIdentity = null, ownedLaunchClaim = null) {
   let currentState = readState(env, ownedLaunchClaim);
-  while (currentState && !isProcessAlive(currentState.pid)) {
-    if (removeStateIfMatches(env, currentState, ownedLaunchClaim)) {
-      return Object.freeze({ ready: true, started: false, mode: 'reused-healthy' });
-    }
+  while (
+    currentState &&
+    recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(currentState))
+  ) {
+    removeStateIfMatches(env, currentState, ownedLaunchClaim);
     currentState = readState(env, ownedLaunchClaim);
   }
   if (!currentState) {
@@ -1039,7 +1078,7 @@ export async function ensureBackendReady({
 
     let currentState = readState(env, claim);
     while (currentState) {
-      if (isProcessAlive(currentState.pid)) {
+      if (!recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(currentState))) {
         if (!stateMatchesConfig(currentState, config, launch, args)) {
           fail(
             'MANAGED_STATE_CONFLICT',
@@ -1048,7 +1087,7 @@ export async function ensureBackendReady({
         }
         fail('MANAGED_BACKEND_UNHEALTHY', 'recorded managed llama-server is alive but failed its health check; use gemini-local restart');
       }
-      if (removeStateIfMatches(env, currentState, claim)) break;
+      removeStateIfMatches(env, currentState, claim);
       currentState = readState(env, claim);
     }
 
@@ -1111,11 +1150,15 @@ export async function ensureBackendReady({
 
   const deadline = Date.now() + startupTimeoutMs;
   while (Date.now() < deadline) {
-    if (!isProcessAlive(child.pid)) {
+    if (recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(state))) {
       removeStateIfMatches(env, state);
       fail('BACKEND_START_FAILED', `managed llama-server exited before becoming healthy; see ${runtime.logPath}`);
     }
     if (await checkBackendHealth(config.backendOrigin, { fetchImpl, timeoutMs: 1_000 })) {
+      if (recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(state))) {
+        removeStateIfMatches(env, state);
+        fail('BACKEND_START_FAILED', `managed llama-server exited before becoming healthy; see ${runtime.logPath}`);
+      }
       return Object.freeze({
         ready: true,
         started: true,
@@ -1159,8 +1202,8 @@ export async function getBackendStatus({ config, env = process.env, fetchImpl = 
       managed: false,
     });
   }
-  const alive = isProcessAlive(state.pid);
-  if (!alive) {
+  const identity = classifyRecordedProcessIdentity(state);
+  if (recordedProcessIdentityIsStale(identity)) {
     return Object.freeze({
       status: 'stale-state',
       healthy,
@@ -1227,7 +1270,10 @@ export async function stopManagedBackend({ config, env = process.env } = {}) {
   if (!isPlainObject(config)) fail('MANAGED_CONFIG_INVALID', 'validated local config is required');
   const state = readState(env);
   if (!state) return Object.freeze({ stopped: false, status: 'not-managed' });
-  if (!stateMatchesConfig(state, config)) {
+  if (
+    !recordedProcessIdentityIsStale(classifyRecordedProcessIdentity(state)) &&
+    !stateMatchesConfig(state, config)
+  ) {
     fail('MANAGED_STATE_CONFLICT', 'recorded managed backend does not match current local config');
   }
   return stopRecordedManagedBackend(state, env);
