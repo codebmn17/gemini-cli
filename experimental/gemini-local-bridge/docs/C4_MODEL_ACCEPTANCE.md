@@ -15,7 +15,7 @@ remains the real local model identity and is never represented as Gemini.
 **PASS — final executable/test acceptance is complete on the real Android/
 Termux target at:**
 
-`864f445832e7185e58d57152965252497b977e45`
+`ef7a7cebf24ad38fd439180b00a800c0d65c3dfd`
 
 Selected production local model:
 
@@ -184,7 +184,7 @@ cleanliness, and a clean worktree.
 After that acceptance was documented, Cloud Codex found one additional P2:
 managed state could still be classified as live from numeric PID liveness alone
 if Android/Linux recycled the PID for a different process. The final executable
-correction is:
+correction for that finding was:
 
 `864f445832e7185e58d57152965252497b977e45`
 
@@ -194,7 +194,24 @@ available. A positively recycled PID follows stale-state cleanup; unknown proc
 identity remains conservative/fail-closed. Full ownership verification remains
 required before signaling.
 
-## Final host verification at `864f445...` — PASS
+That executable became an earlier accepted and device-tested boundary. A later
+Cloud Codex P2 found that explicit restart could stop a verified healthy managed
+backend before discovering that the current managed launch configuration was
+missing, malformed, or otherwise unusable. The final executable correction is:
+
+`ef7a7cebf24ad38fd439180b00a800c0d65c3dfd`
+
+Commit purpose: `C4: preflight managed restart before teardown`.
+
+For a recorded managed process that is not positively dead or recycled,
+explicit restart now fully validates the current managed launch configuration,
+server/model paths, and pinned SHA-256 artifacts before SIGTERM or SIGKILL.
+Ownership is reverified after full artifact hashing and immediately before
+SIGTERM. Missing, malformed, or unusable launch configuration therefore fails
+without tearing down the working process. Positive dead/recycled-state cleanup
+remains ahead of this preflight and never signals a stale or unrelated PID.
+
+## Earlier host verification at `864f445...` — PASS
 
 Host-side verification of the recycled-PID correction recorded:
 
@@ -214,7 +231,7 @@ Host-side verification of the recycled-PID correction recorded:
 The host-only skip existed solely because that host did not have the configured
 real pinned Gemini root. The real-device gate below closes that gap.
 
-## Final Android/Termux revalidation at `864f445...` — PASS
+## Earlier Android/Termux revalidation at `864f445...` — PASS
 
 The exact executable head was fetched from the remote branch, checked out
 detached, installed, and exercised on the real Android/Termux target. The
@@ -290,7 +307,7 @@ On exact `864f445...`:
 The real pinned-Gemini device run closes the host-side conditional integration
 gap.
 
-### Final live production state and integrity snapshot
+### Earlier accepted live production state and integrity snapshot
 
 Final device integrity evidence:
 
@@ -318,25 +335,195 @@ publication markers were absent, normal Gemini remained
 `/data/data/com.termux/files/usr/bin/gemini` version 0.55.1, and the repository
 worktree was clean.
 
+## Final host verification at `ef7a7ce...` — PASS
+
+Host-side verification of the restart-preflight correction recorded:
+
+- deterministic pre-fix reproduction: the focused regression failed 0/1,
+  exit 1, and captured SIGTERM before the missing launch configuration was
+  discovered;
+- C4 managed-launch suite: 68/68 pass, exit 0;
+- focused C3+C4 suite: 75/75 pass, exit 0;
+- complete bridge suite: 229 total, 228 pass, 0 fail, 1 declared conditional
+  pinned-Gemini skip, exit 0;
+- the real pinned Gemini host integration was unavailable because
+  `GEMINI_LOCAL_TEST_PINNED_GEMINI_ROOT` was not configured;
+- all 34 bridge-local `.mjs` files passed `node --check`; the same tracked count
+  was later independently confirmed on the device;
+- installer/uninstaller shell syntax: pass;
+- `git diff --check`: pass;
+- protected `vendor/phase-b` and `PROVENANCE.json` identities unchanged.
+
+The initial macOS focused run encountered the pre-existing `/var` versus
+`/private/var` temporary-path alias in the untouched C3 fixture. Re-running with
+the same temporary directory canonicalized passed 75/75. This was a host fixture
+path-identity issue, not a production defect, and no C3 file was changed.
+
+## Final Android/Termux validation at `ef7a7ce...` — PASS
+
+The exact executable/test head
+`ef7a7cebf24ad38fd439180b00a800c0d65c3dfd` completed three final real-device
+gates on Android 15 / Termux.
+
+### Gate 1: exact-head install continuity — PASS
+
+The remote branch head was fetched and verified exactly as
+`ef7a7cebf24ad38fd439180b00a800c0d65c3dfd` before installation.
+
+Before installation, production was managed-running / healthy / managed /
+owned at PID 7040, with recorded/current proc start ticks `1301853` /
+`1301853`.
+
+After installation:
+
+- PID remained 7040;
+- recorded/current ticks remained `1301853` / `1301853`;
+- authoritative state hash and launch-config hash were unchanged;
+- installed `managed-backend.mjs` and launcher hashes/bytes matched the exact
+  detached source;
+- doctor and status exited 0;
+- no launch claim or publication marker existed;
+- normal Gemini remained `/data/data/com.termux/files/usr/bin/gemini` version
+  0.55.1;
+- the repository worktree remained clean.
+
+This proves that installing the corrected executable did not itself disturb the
+existing healthy managed process.
+
+### Gate 2: restart-safety behavior — PASS
+
+An isolated HOME/runtime and harmless live Android Node process exercised the
+real procfs ownership verifier without risking production. The dummy identity
+was:
+
+```text
+PID: 8919
+executable: /data/data/com.termux/files/usr/bin/node
+proc start ticks: 9431820
+```
+
+With the launch config missing, `gemini-local restart` failed with
+`MANAGED_CONFIG_INVALID`, exit 5, and explicit restore/configure-before-retry
+guidance. The dummy process remained alive and the isolated authoritative state
+remained byte-identical.
+
+With malformed launch JSON, restart again failed with
+`MANAGED_CONFIG_INVALID`, exit 5, and the same correct remediation. The dummy
+process remained alive and the isolated state remained byte-identical.
+
+The isolated failure gate therefore returned `isolated_failure_gate=yes`.
+
+One real production restart was then performed with the valid pinned Q6_K
+launch configuration. Before restart, PID 7040 had matching recorded/current
+ticks `1301853` / `1301853` and verified ownership. Restart exited 0 with result
+`managed-started`. The replacement was PID 9490 with matching recorded/current
+ticks `9433163` / `9433163`; the process identity changed, the old identity was
+gone, exactly one managed llama-server existed, and status was managed-running /
+healthy / managed / owned.
+
+The exact live argv contained:
+
+```text
+-m <selected Q6_K GGUF>
+--host 127.0.0.1
+--port 8090
+-a qwen3.5-4b-uncensored-q6k
+--no-webui
+--offline
+-c 8192
+-np 1
+--no-warmup
+```
+
+Production contained no `--reasoning` flag. State server/model paths and
+configured SHA-256 identities matched the pinned launch config. No launch claim
+or publication marker remained.
+
+The first Gate-2 wrapper printed `android_bounds_present=no` because its shell
+wildcard pattern was incorrect. The captured cmdline already contained the
+correct argv. A subsequent non-destructive adjudication parsed
+`/proc/9490/cmdline` as NUL-delimited argv and returned:
+
+```text
+host_loopback=yes
+context_8192=yes
+parallel_1=yes
+no_warmup=yes
+offline=yes
+no_webui=yes
+reasoning_flag_absent=yes
+android_bounds_present=yes
+managed_process_count=1
+claim_exists=no
+publication_markers=none
+worktree=clean
+gate2_adjudication=yes
+```
+
+The initial `android_bounds_present=no` was therefore an evidence-harness false
+negative, not a product failure.
+
+### Gate 3: final comprehensive exact-head gate — PASS
+
+At exact `ef7a7cebf24ad38fd439180b00a800c0d65c3dfd`:
+
+- C4 managed-launch suite: 68/68 pass, exit 0;
+- focused C3+C4 suite: 75/75 pass, exit 0;
+- default complete bridge suite: 229 total, 228 pass, 0 fail, 1 expected
+  conditional skip, exit 0;
+- complete bridge suite with real pinned Gemini CLI 0.55.1: 229/229 pass,
+  0 fail, 0 skip, exit 0;
+- bridge-local `.mjs`: 34/34 pass, `tracked_mjs_count=34`, exit 0;
+- installer/uninstaller shell syntax: 0 failures, both commands exit 0;
+- `git diff --check`: exit 0.
+
+Final production remained at PID 9490 with recorded/current proc start ticks
+`9433163` / `9433163`, managed-running / healthy / managed / owned. Literal
+loopback, context 8192, parallel 1, no-warmup, offline, and no-webui checks all
+returned yes. The reasoning flag was absent, exactly one managed process
+existed, the launch claim and publication markers were absent, and the worktree
+was clean.
+
+Final artifact and protected-object identities were:
+
+```text
+llama-server SHA-256:
+94f9aa667e042be00f8270cc8ae384db0dcf1587b9cac45cc22ce8c85704d594
+
+selected GGUF SHA-256:
+ba93c21300854075ab42655bc30dca82c7c6c958f511d1ec9ea2b3e750b4b75f
+
+vendor/phase-b Git tree:
+1291c0266e334b7c78ac8a96f1184a16a9657d08
+
+PROVENANCE.json Git blob:
+4d330a6056decdd17dbf52b6bcfcc85cb84ba178
+```
+
+Normal Gemini remained `/data/data/com.termux/files/usr/bin/gemini` version
+0.55.1.
+
 ## Acceptance/freeze state
 
 C4 executable/device acceptance is therefore frozen at:
 
-`864f445832e7185e58d57152965252497b977e45`
+`ef7a7cebf24ad38fd439180b00a800c0d65c3dfd`
 
-The acceptance refs remain intentionally separate:
+The acceptance refs remain intentionally separate and must be moved only by the
+authorized final reconciliation step:
 
-- executable/device ref: `accepted/gemini-local-c4-device-proof-v1`;
-- final documentation ref: `accepted/gemini-local-c4-final-docs-v1`.
+- `accepted/gemini-local-c4-device-proof-v1` should ultimately point to
+  `ef7a7cebf24ad38fd439180b00a800c0d65c3dfd`;
+- `accepted/gemini-local-c4-final-docs-v1` should ultimately point to this new
+  documentation-only reconciliation commit.
 
-The executable/device ref must point to the exact device-tested executable head
-above. The final-docs ref points to the documentation-only reconciliation commit
-containing this completed record.
+This new commit changes documentation only over `ef7a7ce...`; it does not create
+a later executable/test boundary.
 
 PR #9 remains an isolated C4 review/acceptance vehicle and is not intended to be
-merged into `main` as part of this acceptance. After the refs are pinned and all
-final review findings are resolved, it may be closed **unmerged** unless a
-separate integration decision explicitly authorizes a merge.
+merged into `main`. It will be closed **unmerged** only after this final
+documentation commit, the acceptance refs, review-thread resolution, and final
+metadata check are complete.
 
 ## Explicitly deferred beyond C4
 
