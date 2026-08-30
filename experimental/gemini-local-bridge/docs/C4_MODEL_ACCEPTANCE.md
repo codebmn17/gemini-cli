@@ -1,24 +1,21 @@
 # C4 production-model acceptance
 
-C4 is the final model-selection and real-device acceptance phase for
-`gemini-local`. It starts from the completed C3 lifecycle documentation head:
+C4 is the final production-model selection and real-device acceptance phase for
+`gemini-local`. It starts from the completed C3 documentation boundary:
 
 `accepted/gemini-local-c3-final-docs-v1` -> `d5da3f6fe9e90c8844e1ef7bdf3e91134098bbcc`
 
-The bridge, managed llama-server lifecycle, Android ownership verification,
-Termux full-chain execution, and no-hosted-fallback boundary were already
-accepted before C4. C4 does not reopen or weaken those boundaries merely to
-accommodate a model.
+C4 does not reopen the accepted C1-C3 trust boundaries. Official Gemini CLI
+remains the host/interface; inference remains local through the accepted
+Gemini/GenAI <-> llama.cpp compatibility adapter; the actual backend identity
+remains the real local model identity and is never represented as Gemini.
 
-## Device-tested baseline
+## Final C4 verdict
 
-**PASS — the original C4 real-device acceptance is complete at the exact
-executable/test head below. The current PR head contains later production
-review hardening and is not yet device-accepted.**
+**PASS — final executable/test acceptance is complete on the real Android/
+Termux target at:**
 
-Last real-device-tested executable/test head:
-
-`68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`
+`b6943932b46eb10a96c791bd1030a10dac923eea`
 
 Selected production local model:
 
@@ -42,94 +39,71 @@ Accepted Android managed-launch policy:
 --no-warmup
 ```
 
-Production launch leaves reasoning enabled. `--reasoning off` was used only in
-a deterministic direct-response evidence probe and is not part of the managed
-production argv.
-
-The prior Qwen2.5-0.5B GGUF remains smoke/plumbing evidence only. Q4_K_M is a
-fallback candidate, not the selected production model. Qwen3.6 was reviewed,
-but the currently available open-weight sizes were not viable for the accepted
-capacity envelope of this phone.
+Production reasoning remains enabled. `--reasoning off` was used only for one
+deterministic direct-response evidence probe and is absent from production
+managed argv.
 
 ## Frozen boundaries
 
-C4 preserves all accepted C3 properties:
+The final C4 tree preserves the accepted boundaries:
 
-- official Gemini CLI host remains pinned at 0.55.1;
-- inference stays local through the accepted Gemini/GenAI <-> llama.cpp
-  compatibility adapter;
-- backend identity remains the real local-model identity and is never
-  rebranded as Gemini;
-- backend origin remains literal loopback only;
-- no hosted Gemini fallback exists on any failure path;
-- no Gemini credential or arbitrary caller header reaches llama-server;
-- managed llama-server startup/reuse/status/stop/restart retains hash-pinned
-  process ownership checks;
+- official Gemini CLI host pinned at 0.55.1;
+- local inference through llama.cpp on literal `127.0.0.1` only;
+- no hosted-Gemini fallback on any failure path;
+- no Gemini credential/cookie/arbitrary caller-header forwarding to llama-server;
+- backend identity remains `qwen3.5-4b-uncensored-q6k`, never renamed Gemini;
+- server/model launch artifacts remain path- and SHA-256-pinned;
+- full artifact hashing remains mandatory before a new managed spawn;
+- ownership verification remains mandatory before managed process signaling;
+- Android argv remains launcher-owned and contains exactly the accepted mobile
+  bounds above in addition to the accepted loopback/offline/no-webui policy;
+- no generic `serverArgs` escape hatch;
+- no production `--reasoning off`;
+- C2 six-key local config remains unchanged;
 - `vendor/phase-b/*` and `PROVENANCE.json` remain immutable;
-- normal `gemini` and the pre-existing Ollama installation remain untouched;
-- no GGUF or llama.cpp binary is committed to this repository;
-- no package-manager install/update is implicit in model acceptance.
+- normal `gemini` and the existing Ollama installation remain untouched;
+- no GGUF/model weights or llama.cpp binary are committed;
+- no package-manager install/update is implicit in C4.
 
-## C4-0: read-only device capacity/source gate — PASS
+## C4-0: read-only capacity/source gate — PASS
 
-Actual Android/Termux evidence recorded before the production-model download:
+Before the production-model download, the real Android/Termux target reported:
 
-- filesystem: 101 GiB total, 94 GiB used, 6.7 GiB available, 94% used;
+- filesystem: 101 GiB total, 6.7 GiB available;
 - RAM: 10 GiB total;
 - swap: 15 GiB total;
 - existing C3 smoke-model directory: about 470 MiB;
 - pinned llama.cpp build: about 960 MiB;
-- `gemini-local status`: exit 0, managed-running, healthy, managed, owned
-  process verified;
-- normal Gemini preserved at version 0.55.1;
-- existing smoke GGUF: Qwen2.5-0.5B, about 469 MiB.
+- `gemini-local status`: managed-running / healthy / managed / owned;
+- normal Gemini: 0.55.1.
 
-### Qwen3.6 viability review
+Qwen3.6 was explicitly evaluated but the available open-weight sizes were not
+viable for the accepted phone capacity envelope. Qwen3.5 9B was also rejected
+as storage-tight. The 4B Q6_K artifact provided the accepted quality/capacity
+balance. Qwen2.5-0.5B remains smoke/plumbing evidence only, and Q4_K_M remains a
+fallback candidate rather than the selected model.
 
-Qwen3.6 was explicitly evaluated rather than ignored. The available official
-open-weight releases and their uncensored GGUF derivatives were substantially
-larger than this phone's accepted storage/runtime envelope. C4 therefore
-rejected Qwen3.6 for this device at current capacity. It can be revisited if a
-smaller release appears or the target hardware/storage changes.
+## C4-1: verified Q6_K download — PASS
 
-### Qwen3.5 selection rationale
+The exact Q6_K artifact was downloaded to a temporary `.part` path and promoted
+only after both size and hash checks passed.
 
-Candidates considered included larger 9B and higher-precision 4B variants, but
-the 4B Q6_K artifact provided the best accepted balance of model quality and
-remaining phone headroom. Publisher claims about uncensoring/refusal rate and
-capability preservation are treated as claims, not independent proof; the C4
-fitness gate below is the device-side evidence used for acceptance.
+Observed real-device evidence:
 
-## C4-1: verified production GGUF download — PASS
-
-The selected Q6_K artifact was downloaded to a temporary `.part` path and was
-promoted only after both identity checks passed.
-
-Observed device evidence:
-
-- download exit: 0;
-- expected byte size: 3,464,055,136;
-- actual byte size: 3,464,055,136;
-- expected SHA-256:
+- download exit 0;
+- expected/actual byte size: 3,464,055,136;
+- expected/actual SHA-256:
   `ba93c21300854075ab42655bc30dca82c7c6c958f511d1ec9ea2b3e750b4b75f`;
-- actual SHA-256 matched exactly;
-- final GGUF mode was set read-only (`0400`);
-- post-download filesystem state was approximately 101 GiB total, 98 GiB
-  used, 3.4 GiB available.
+- final model file mode: `0400`;
+- no package install/update or unrelated deletion was performed.
 
-No package install/update, unrelated deletion, model replacement, or server
-mutation was performed as part of the download gate.
+## C4-2: direct real-model proof — PASS
 
-## C4-2: direct llama-server proof — PASS
+The first unconstrained Q6_K launch terminated during initialization before
+`model loaded` / `listening`. No kernel OOM evidence was available, so that
+attempt is not labeled a proven OOM.
 
-The exact selected Q6_K bytes were tested with the existing pinned llama.cpp
-build.
-
-The first unconstrained launch terminated during model initialization before
-`model loaded` / `listening`. No kernel OOM evidence was available, so C4 does
-not label that event a proven OOM.
-
-A bounded retry established the mobile-safe launcher policy:
+A controlled retry using the final Android bounds proved the exact model works:
 
 ```text
 -c 8192
@@ -137,232 +111,240 @@ A bounded retry established the mobile-safe launcher policy:
 --no-warmup
 ```
 
-With those bounds, the exact model loaded successfully and became healthy on
-Android. Observed evidence included:
+Observed evidence included:
 
-- loopback listener only on `127.0.0.1:8090`;
-- exact backend identity `qwen3.5-4b-uncensored-q6k`;
+- exact Q6_K server healthy in about 12 seconds;
+- listener only on `127.0.0.1:8090`;
 - `n_slots = 1`;
 - `n_ctx_slot = 8192`;
-- `model loaded` observed in the real llama-server log;
-- deterministic direct completion returned exactly `C4_Q6K_FINAL_OK`;
-- direct response reported `finish_reason:"stop"`;
+- deterministic direct-response probe returned `C4_Q6K_FINAL_OK`;
 - loaded-memory snapshot left roughly 3.2 GiB RAM available and about 12 GiB
   swap free;
-- the small deterministic response generated at about 11.96 tokens/second.
+- small-response generation measured about 11.96 tokens/second.
 
-For the exact-token direct probe only, `--reasoning off` was added to make the
-output deterministic. Production managed launch does not contain that flag.
+## C4-3/C4-4: managed full chain and lifecycle — PASS
 
-## Managed-launch implementation — PASS
-
-Host implementation commit:
-
-`c5c69103f64abd30a3bcc1471e0af0eb7af8b79b`
-
-The production launcher owns the Android-specific memory controls. Android/
-Termux appends exactly `-c 8192 -np 1 --no-warmup`; Linux and other non-Android
-platforms retain the accepted pre-C4 argv.
-
-The change did not add a generic `serverArgs` escape hatch and did not add
-`--reasoning off`. Loopback binding, `--offline`, `--no-webui`, `shell:false`,
-sanitized child environment, hash-pinned artifacts, no hosted fallback, and
-managed-process ownership verification remain intact.
-
-Host verification at this stage included:
-
-- focused managed/C3/C4 tests: 10/10 pass;
-- complete bridge suite: 163 pass, 0 fail, 1 intentional skip (164 total);
-- all bridge `.mjs` syntax: 34/34;
-- installer/uninstaller `bash -n`: 2/2;
-- `vendor/phase-b/*` and `PROVENANCE.json`: unchanged.
-
-## C4-3: ordinary managed full-chain proof — PASS
-
-The reviewed managed-launch change was installed on the real Android/Termux
-device, and the local configuration was switched from the 0.5B smoke model to
-the exact verified Qwen3.5 4B Q6_K artifact.
-
-Starting from a stopped backend, an ordinary command:
+The production configuration was switched from the C3 smoke model to the exact
+Q6_K artifact. From a stopped backend, ordinary `gemini-local` use completed:
 
 ```text
-gemini-local <prompt>
-```
-
-automatically started the managed llama-server and completed the real chain:
-
-```text
-real pinned Gemini CLI
+real pinned Gemini CLI 0.55.1
   -> local Gemini/GenAI compatibility adapter
   -> managed loopback llama-server
   -> Qwen3.5 4B Q6_K
 ```
 
-Observed evidence:
+Observed evidence included:
 
-- exact acceptance response `C4_MANAGED_FULL_CHAIN_OK`;
-- prompt exit 0;
-- exact-content check exit 0;
-- backend status `managed-running`;
-- backend healthy: yes;
-- managed: yes;
+- exact full-chain response `C4_MANAGED_FULL_CHAIN_OK`;
+- managed-running / healthy / managed;
 - `Owned process verified: yes`;
-- exact managed Android argv included `-c 8192 -np 1 --no-warmup`;
-- production argv did not contain `--reasoning off`;
-- normal Gemini remained version 0.55.1.
-
-## C4-4: managed lifecycle proof — PASS
-
-The real device proved the lifecycle expected for normal use:
-
-- a second ordinary prompt returned `C4_REUSE_OK` with exit 0;
-- the managed PID stayed unchanged during reuse;
-- `gemini-local stop` terminated the verified owned backend and released port
-  8090;
-- `gemini-local restart` created a new healthy managed PID;
-- the restarted process still used the selected Q6_K model and accepted Android
-  bounds;
-- ownership verification remained `yes`;
-- normal Gemini remained preserved.
-
-The final lifecycle machine summary was all-zero across reuse/content,
-same-PID, stop, old-PID-down, port-down, restart, health, restart-status,
-new-PID, and normal-Gemini preservation checks.
+- exact Android argv including `-c 8192 -np 1 --no-warmup`;
+- no production `--reasoning off`;
+- same-PID reuse response `C4_REUSE_OK`;
+- verified stop of the owned process;
+- restart to a new healthy owned PID;
+- normal Gemini preserved at 0.55.1.
 
 ## C4-5: practical model fitness — PASS with one documented miss
 
-C4 did not accept the model merely because it could load. It exercised the
-selected model through ordinary `gemini-local` use.
+The selected model was exercised through ordinary `gemini-local` use rather
+than accepted only because it could load.
 
-### Instruction/reasoning probe
+- instruction/reasoning probe returned exact `DBACE`;
+- architecture/identity probe correctly distinguished the local Qwen backend
+  from Gemini and described local llama.cpp/loopback inference;
+- first URL-parser coding challenge exposed a genuine model logic error plus a
+  Markdown-fence compliance miss, retained as evidence rather than hidden;
+- second executable CommonJS coding probe passed extraction, syntax, and
+  semantic checks and returned `C4_CODE_FITNESS_2_OK`.
 
-The constrained ordering task returned the exact expected answer `DBACE` with
-prompt/content exits 0.
+Assessment: Qwen3.5 4B Q6_K is accepted as the current free local default. It is
+usable but not infallible as a coding model. The bridge remains model-swappable
+for future stronger compatible local models.
 
-### Architecture/identity probe
+## Baseline device gate and later Cloud hardening
 
-The model correctly described the running inference backend as Qwen3.5 through
-llama.cpp, distinguished the local Qwen model from Gemini, and described local
-loopback inference with no hosted-Gemini fallback.
-
-### Coding probe
-
-The first URL-parser challenge exposed a genuine model logic error plus a
-Markdown-fence compliance miss. That failure is intentionally retained as
-quality evidence rather than hidden.
-
-A second executable CommonJS coding challenge passed extraction, syntax, and
-semantic tests. `C4_CODE_FITNESS_2_OK` was observed, with final machine summary:
-
-```text
-prompt=0 extract=0 syntax=0 semantic=0 status=0
-```
-
-Assessment: the selected Qwen3.5 4B Q6_K model is accepted as the current free
-local default. It is useful but not infallible as a coding model, and the bridge
-remains deliberately model-swappable so a stronger compatible local model can
-replace it later without redesigning the Gemini-local transport.
-
-## Final-suite stale C3 fixture correction
-
-The first final-regression run exposed one stale C3 expected-argv fixture in
-`test/c3-device-finalization.test.mjs`. It still hardcoded the pre-C4 Android
-argv ending at `--no-webui --offline`, while the accepted Android production
-argv now correctly appends `-c 8192 -np 1 --no-warmup`.
-
-This was a test-fixture defect, not a production runtime defect.
-
-Test-only correction commit:
+The original final-device baseline was established at:
 
 `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`
 
-The correction imports `buildManagedLlamaServerArgs`, uses the same config
-passed to `ensureBackendReady`, and compares captured argv against the current
-platform-aware builder. Independent assertions for the executable,
-`shell:false`, detached process behavior, credential stripping, and proxy
-stripping remain. The dedicated C4 platform-policy test remains independent.
-No production behavior changed in this correction.
+That baseline included the test-only correction of a stale C3 expected-argv
+fixture and produced `C4-6 PASS — FINAL DEVICE REGRESSION GATE GREEN`.
 
-## C4-6: baseline Android/Termux regression/freeze gate — PASS at `68d9ca717...`
+Independent Cloud Codex review then found multiple real managed-lifecycle race,
+status-consistency, and portability issues after that baseline. These were
+fixed incrementally rather than waived. The final executable head includes:
 
-The corrected exact head
-`68d9ca71707341eb01bf7f9f3c8ccf9d99efe367` was fetched, checked out detached,
-reinstalled, and re-executed on the real Android/Termux device.
+- current-launch identity/policy checks before managed reuse/status success;
+- dead-state ordering and re-read protections;
+- exclusive managed-launch ownership claim before spawn;
+- atomic normal claim release;
+- successor-safe stale-claim reclamation;
+- bounded retry handling for public-claim handoffs and empty stale-reclamation
+  windows;
+- no-clobber managed-state publication without hard-link dependency;
+- explicit state-publication coordination so concurrent readers never consume
+  legitimate partial ownership state;
+- safe rollback/successor preservation;
+- bounded acquisition contention;
+- preserved Android/non-Android argv policy and all security boundaries above.
 
-The gate printed:
+The real Android target then exposed one additional portability defect that the
+host could not reproduce: `link(2)` inside the Termux private runtime returned
+`EACCES`. The managed-state lifecycle was corrected to require no hard links.
+Cloud review then found and drove correction of the resulting partial-state
+visibility window. The final reviewed executable candidate became:
+
+`b6943932b46eb10a96c791bd1030a10dac923eea`
+
+## Final host verification at `b6943932...` — PASS
+
+Host-side verification of the final executable candidate recorded:
+
+- C4 managed-launch suite: 49/49 pass;
+- focused C3+C4: 56/56 pass;
+- complete bridge suite: 209 pass, 0 fail, 1 conditional real-pinned-Gemini
+  skip (210 total);
+- `.mjs` syntax: 37/37;
+- installer/uninstaller `bash -n`: 2/2;
+- `git diff --check`: pass;
+- protected `vendor/phase-b` and `PROVENANCE.json`: unchanged;
+- production contains no `linkSync`, generic `serverArgs`, or production
+  `--reasoning off`.
+
+The host-only skip existed solely because that host did not have the configured
+real pinned Gemini root. The real-device gate below closes that gap.
+
+## Final Android/Termux revalidation at `b6943932...` — PASS
+
+The exact final executable head was fetched, checked out detached, installed,
+and exercised on the real Android/Termux target. The repository worktree was
+clean.
+
+### Sequential cold start
+
+Starting from a genuinely stopped backend with no state/claim/server process,
+an ordinary prompt returned exactly:
+
+`C4_PORTABLE_STATE_OK`
+
+with exit 0.
+
+Post-start evidence:
+
+- backend status: `managed-running`;
+- healthy: yes;
+- managed: yes;
+- owned process verified: yes;
+- authoritative managed state present;
+- launch claim absent;
+- state-publication marker absent.
+
+This proves the final no-hard-link state publication works on the actual Termux
+filesystem.
+
+### Exact live process policy
+
+The real managed server used:
+
+- executable:
+  `/data/data/com.termux/files/home/llama-cpp-c3/build/bin/llama-server`;
+- model:
+  `/data/data/com.termux/files/home/c4-models/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf`;
+- `--host 127.0.0.1`;
+- `--port 8090`;
+- `-a qwen3.5-4b-uncensored-q6k`;
+- `--no-webui`;
+- `--offline`;
+- `-c 8192`;
+- `-np 1`;
+- `--no-warmup`;
+- no `--reasoning off`.
+
+Exactly one matching llama-server process existed.
+
+### Concurrent cold start
+
+The verified owned backend was stopped, its old PID went down, and two ordinary
+`gemini-local` prompts were started concurrently.
+
+Observed result:
+
+- one contender failed safely with `MANAGED_LAUNCH_IN_PROGRESS`;
+- the other succeeded with exact `C4_CONCURRENT_B`;
+- exactly one new llama-server process existed afterward;
+- backend was managed-running / healthy / managed / owned;
+- launch claim absent;
+- state-publication markers absent;
+- subsequent ordinary prompt returned `C4_AFTER_RACE_OK`;
+- same PID was preserved on stable reuse.
+
+This directly proves the final launch serialization and portable state
+publication operate together correctly on the real target.
+
+### Final device regression suites
+
+On the exact final executable head:
+
+- focused C3+C4 suite: exit 0;
+- default complete bridge suite: 210 total, 209 pass, 0 fail, 1 expected
+  conditional skip;
+- complete bridge suite with the real pinned Gemini 0.55.1 root: **210/210
+  pass, 0 fail, 0 skip**;
+- all `.mjs` syntax checks: exit 0;
+- installer/uninstaller shell syntax: 0/0;
+- `git diff --check`: exit 0.
+
+The real pinned-Gemini device run therefore closes the only host-side
+conditional integration gap.
+
+### Final integrity snapshot
+
+Final device integrity evidence:
 
 ```text
-C4-6 PASS — FINAL DEVICE REGRESSION GATE GREEN
+executable/test SHA:
+b6943932b46eb10a96c791bd1030a10dac923eea
+
+llama-server SHA-256:
+94f9aa667e042be00f8270cc8ae384db0dcf1587b9cac45cc22ce8c85704d594
+
+selected GGUF SHA-256:
+ba93c21300854075ab42655bc30dca82c7c6c958f511d1ec9ea2b3e750b4b75f
+
+vendor/phase-b Git tree:
+1291c0266e334b7c78ac8a96f1184a16a9657d08
+
+PROVENANCE.json Git blob:
+4d330a6056decdd17dbf52b6bcfcc85cb84ba178
 ```
 
-That gate only prints PASS when its acceptance checks are all zero. The device
-gate covered:
+Both configured artifact-hash comparisons returned `yes`. Final status was
+managed-running / healthy / managed / owned, with exactly one llama-server
+process. The launch-claim path was absent, publication markers were absent,
+normal Gemini remained `/data/data/com.termux/files/usr/bin/gemini` version
+0.55.1, and the repository worktree was clean.
 
-- exact expected checkout SHA;
-- clean worktree;
-- selected production GGUF SHA;
-- pinned llama-server SHA;
-- pre-suite managed-running/healthy/owned state;
-- focused C3/C4 regressions;
-- complete default bridge suite;
-- complete suite using the real pinned Gemini root;
-- all `.mjs` syntax checks;
-- installer/uninstaller shell syntax;
-- `git diff --check`;
-- immutable `vendor/phase-b/*` / `PROVENANCE.json` boundary;
-- post-suite backend health/status;
-- unchanged managed PID during regression execution;
-- final owned-process verification;
-- normal Gemini path/version preservation.
+## Acceptance/freeze state
 
-That evidence establishes `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`
-as the last accepted device-tested baseline. It does **not** validate later
-production-code commits.
+C4 executable/device acceptance is therefore frozen at:
 
-## Post-acceptance Cloud Codex hardening — DEVICE REVALIDATION REQUIRED
+`b6943932b46eb10a96c791bd1030a10dac923eea`
 
-Cloud Codex subsequently found a P2 in the healthy managed-backend reuse path:
-a healthy process started under an older launcher policy could be reused before
-current config and launcher policy were compared.
+The acceptance refs are intentionally separate:
 
-The bounded correction is:
+- executable/device ref: `accepted/gemini-local-c4-device-proof-v1`;
+- final documentation ref: `accepted/gemini-local-c4-final-docs-v1`.
 
-- runtime fix: `8997b1bd60459f83fa4077385524c166f5965089`;
-- regression coverage: `c9a991bdaa20a48ceb0fd5a58e3a83ffdd5ead12`.
+The executable/device ref must point to the exact device-tested executable head
+above. The final-docs ref points to the documentation-only reconciliation commit
+containing this completed record.
 
-The corrected state records a SHA-256 fingerprint of the exact launcher-owned
-argv. Before healthy managed reuse, the runner now compares current protocol
-config, lightweight pinned launch identity, and the current launcher argv
-policy against the recorded state. Legacy state without a policy fingerprint
-is intentionally incompatible. A mismatch fails closed with
-`MANAGED_STATE_CONFLICT` and requires `gemini-local restart`.
-
-The healthy fast path reads configured server/model identity without re-hashing
-the multi-GiB GGUF on every prompt. Full server/model SHA verification remains
-mandatory before any new managed spawn. Restart may replace a differently
-configured prior managed process only after the existing ownership verifier
-proves that the recorded process is still the owned llama-server.
-
-Because this changes production behavior after the prior C4-6 device gate,
-**the current review-hardening head is not accepted yet**. Fresh host validation
-and a fresh Android/Termux final gate must pass on the final executable/test
-head before any new C4 acceptance ref is created. Until then, the permanent
-accepted executable boundary remains `68d9ca71707341eb01bf7f9f3c8ccf9d99efe367`.
-
-## Repo acceptance / freeze state
-
-The original C4 model/runtime acceptance is preserved at the baseline SHA above,
-but the current PR head is deliberately **not frozen as accepted** while the
-post-review production hardening awaits fresh validation.
-
-Do not create or move a C4 executable/device acceptance ref to the review
-hardening head until the fresh device gate is green. After that gate, reconcile
-this document with the newly tested SHA, create the corresponding acceptance
-ref, and only then close PR #9 unmerged unless a separate integration decision
-explicitly authorizes a merge.
-
-Do not merge PR #9 unless a separate integration decision is explicitly
-authorized.
+PR #9 is an isolated C4 review/acceptance vehicle and is not intended to be
+merged into `main` as part of this acceptance. After the refs are pinned and the
+final review thread is resolved, close PR #9 **unmerged** unless a separate
+integration decision explicitly authorizes a merge.
 
 ## Explicitly deferred beyond C4
 
